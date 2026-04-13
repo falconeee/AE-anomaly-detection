@@ -375,14 +375,12 @@ class LSTM_AE:
             
             return {
                 'timestamp': final_timestamps,
-                'phi': final_scores.tolist(),
-                'is_anomaly': (np.array(final_scores) > self.threshold).tolist()
+                'phi': final_scores.tolist()
             }
         else:
             return {
                 'timestamp': np.arange(len(all_scores)).tolist(),
-                'phi': all_scores.tolist(),
-                'is_anomaly': (np.array(all_scores) > self.threshold).tolist()
+                'phi': all_scores.tolist()
             }
 
     def contribution(self, df_anomaly, timestamps=None, df_sistema=None, batch_size=32):
