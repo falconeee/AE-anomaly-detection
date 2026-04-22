@@ -201,8 +201,9 @@ class CNN_AE:
         self.seed = seed
         
         self.set_deterministic(self.seed)
-        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
         self.scaler = MinMaxScaler()
         self.model = None
         self.threshold = None

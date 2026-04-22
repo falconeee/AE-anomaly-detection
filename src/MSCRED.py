@@ -423,9 +423,10 @@ class MSCRED:
             'gap_time': 1,            # Sliding window stride
             'learning_rate': 0.0003,
             'epochs': 5,
-            'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            'device': torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         }
         self.device = self.model_config['device']
+        print(f"Using device: {self.device}")
         self.model = None
         self.scaler_params = None
         self.threshold = None

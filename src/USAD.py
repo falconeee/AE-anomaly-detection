@@ -12,7 +12,7 @@ from sklearn.preprocessing import MinMaxScaler
 
 
 def get_default_device():
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
 class SPOT:
     """ Algoritmo Streaming Peaks-Over-Threshold (EVT) para limiares dinâmicos. """

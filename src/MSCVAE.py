@@ -564,7 +564,12 @@ class MSCVAE:
         
         # Hardware selection: automatically defaults to GPU if available for faster tensor operations
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
         else:
             self.device = device
             
