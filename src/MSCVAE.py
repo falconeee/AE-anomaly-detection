@@ -36,6 +36,9 @@ class AttributeMatrixGenerator:
         full_train_df = pd.concat(train_dataframes, ignore_index=True)
         self.mean = full_train_df.mean()
         self.std = full_train_df.std() + 1e-6 # Added epsilon to prevent division by zero
+        
+        # Store minimum values of each feature to clip negative reconstruction values to their physical minimum
+        self.min_physical_vals = full_train_df.min()
 
     def generate(self, df):
         if self.mean is None:
@@ -940,14 +943,24 @@ class MSCVAE:
         
         contributions_dict = df_contrib.to_dict()
 
-        # Denormalize reconstructed values (apply Z-score backwards) so they can be 
-        # plotted alongside the real physical values in a dashboard.
+        # Denormalize reconstructed values (apply Z-score backwards)
         recon_arr = np.array(reconstructed_vals)
         recon_data = {}
         for i, col in enumerate(variable_names):
             mean = self.generator.mean[col]
             std = self.generator.std[col]
+            
+            # Get the physical lower bound learned by the generator
+            physical_min = self.generator.min_physical_vals[col]
+            
             rec_real = (recon_arr[:, i] * std) + mean
+            
+            # Smooth Clipping (Hyperbolic Soft Maximum)
+            # Prevents flatlining at 0.0 while maintaining a strict physical floor and signal noise
+            L = 0.0 if physical_min >= 0.0 else physical_min
+            gamma = 0.05 # Curvature factor. Kept small to maintain precision.
+            rec_real = (rec_real + L + np.sqrt((rec_real - L)**2 + gamma)) / 2.0
+            
             recon_data[f"{col}"] = rec_real
             
         reconstruction_df = pd.DataFrame(recon_data)
