@@ -36,8 +36,6 @@ class AttributeMatrixGenerator:
         full_train_df = pd.concat(train_dataframes, ignore_index=True)
         self.mean = full_train_df.mean()
         self.std = full_train_df.std() + 1e-6 # Added epsilon to prevent division by zero
-        
-        # Store minimum values of each feature to clip negative reconstruction values to their physical minimum
         self.min_physical_vals = full_train_df.min()
 
     def generate(self, df):
@@ -294,7 +292,7 @@ class MSCVAE_Hybrid(nn.Module):
 
         return recon_matrix, recon_values, mu, logvar
 
-    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=2.0, beta=0.6):
+    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=5.0, beta=0.6):
         """
         Multitask Loss Function (Beta-VAE framework).
         """
@@ -825,7 +823,7 @@ class MSCVAE:
                 'phi': all_scores
             }
 
-    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, weight=0.5):
+    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
         """
         Root Cause Analysis (RCA) pipeline.
         Identifies exactly which sensors caused the anomaly by measuring 
@@ -893,21 +891,10 @@ class MSCVAE:
         mat_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
         val_scores = total_error_val.cpu().numpy()
         
-        # Dimensional balance: A matrix row has N elements, the value has 1.
+        # Dimensional balance: A matrix row has N elements, the value has 1. 
+        # We multiply by N so the value error holds equal voting weight in the final score.
         val_scores_scaled = val_scores * n_features
-        
-        # BALANCED FUSION (Geometric Mean / Weighted Product)
-        # Instead of summing, we multiply. This ensures the top variable not only 
-        # breaks systemic correlations (high mat_scores) but also shows clear visual 
-        # deviation (high val_scores), aligning mathematical output with dashboard visual expectations.
-        
-        # Added a small epsilon (+1e-6) to prevent zeroing the score if one of the errors is perfectly zero.
-        # weight = 0.5 means equal weight to both matrix and value errors, 
-        # weight = 1.0 means only value error is considered,
-        # weight = 0.0 means only matrix error is considered
-        weight_values = weight
-        weight_matrices = 1.0 - weight
-        variable_scores = ((mat_scores + 1e-6) ** weight_matrices) * ((val_scores_scaled + 1e-6) ** weight_values)
+        variable_scores = mat_scores + (alpha * val_scores_scaled)
         
         variable_names = self.generator.mean.index
         total_period_error = np.sum(variable_scores)
@@ -925,14 +912,30 @@ class MSCVAE:
         df_contrib['DESC'] = df_contrib['DESC'].fillna('NoDesc')
         df_contrib['SISTEMA'] = df_contrib['SISTEMA'].fillna('NoSystem')
         
-        # Sort by reconstruction error (descending)
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # Keep only the top 8 biggest contributors
-        df_contrib = df_contrib.head(8).copy()
+        # Dynamic Identification with MAD Approach
+        # Median Absolute Deviation is robust against the "Masking Effect".
+        # If a massive anomaly occurs, classical standard deviation gets skewed, hiding the anomaly.
+        # MAD relies on the median (normal sensors), creating an unbreakable baseline.
+        df_contrib_backup = df_contrib.copy()
+        
+        median_score = df_contrib['score'].median()
+        mad = (df_contrib['score'] - median_score).abs().median()
+        
+        # Standard scale factor (k=1.4826) makes MAD comparable to a normal standard deviation.
+        k = 1.4826
+        # Dynamic threshold: Only isolates sensors mathematically behaving as extreme outliers
+        mad_threshold = median_score + (k * mad)
+        
+        df_contrib = df_contrib[df_contrib['score'] > mad_threshold].copy()
+        
+        # Fallback: If the anomaly is too subtle for the MAD threshold, force return the top 3 culprits
+        if len(df_contrib) == 0:
+            df_contrib = df_contrib_backup.head(3).copy()
 
-        # Final Formatting
-        # Recalculate relative weights strictly within the isolated anomalous subgroup (Top 8)
+        # Final Formatting & Reconstructions
+        # Recalculate relative weights strictly within the isolated anomalous subgroup
         if df_contrib['score'].sum() > 0:
             df_contrib['%'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
         else:
