@@ -760,6 +760,9 @@ class MSCVAE:
             raise ValueError("Model not trained. Call .fit() first!")
 
         self.model.eval()
+
+        # Filter columns to match the generator's expected features
+        df_test = df_test[self.generator.mean.index]
         
         # Transform raw test data into correlation matrices
         try:
@@ -830,6 +833,9 @@ class MSCVAE:
             raise ValueError("Model not trained. Call .fit() first!")
         
         self.model.eval()
+
+        # Filter columns to match the generator's expected features
+        df_test = df_test[self.generator.mean.index]
         
         # Generate spatial-temporal matrices and target values from the raw dataframe
         try:
