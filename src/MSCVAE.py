@@ -893,9 +893,12 @@ class MSCVAE:
         # deviation (high val_scores), aligning mathematical output with dashboard visual expectations.
         
         # Added a small epsilon (+1e-6) to prevent zeroing the score if one of the errors is perfectly zero.
-        peso_valor = weight
-        peso_matriz = 1.0 - weight
-        variable_scores = ((mat_scores + 1e-6) ** peso_matriz) * ((val_scores_scaled + 1e-6) ** peso_valor)
+        # weight = 0.5 means equal weight to both matrix and value errors, 
+        # weight = 1.0 means only value error is considered,
+        # weight = 0.0 means only matrix error is considered
+        weight_values = weight
+        weight_matrices = 1.0 - weight
+        variable_scores = ((mat_scores + 1e-6) ** weight_matrices) * ((val_scores_scaled + 1e-6) ** weight_values)
         
         variable_names = self.generator.mean.index
         total_period_error = np.sum(variable_scores)
@@ -916,11 +919,11 @@ class MSCVAE:
         # Sort by reconstruction error (descending)
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # Keep only the top 6 biggest contributors
-        df_contrib = df_contrib.head(6).copy()
+        # Keep only the top 8 biggest contributors
+        df_contrib = df_contrib.head(8).copy()
 
         # Final Formatting
-        # Recalculate relative weights strictly within the isolated anomalous subgroup (Top 6)
+        # Recalculate relative weights strictly within the isolated anomalous subgroup (Top 8)
         if df_contrib['score'].sum() > 0:
             df_contrib['%'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
         else:
