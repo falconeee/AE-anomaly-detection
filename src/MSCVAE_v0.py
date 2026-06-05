@@ -36,6 +36,7 @@ class AttributeMatrixGenerator:
         full_train_df = pd.concat(train_dataframes, ignore_index=True)
         self.mean = full_train_df.mean()
         self.std = full_train_df.std() + 1e-6 # Added epsilon to prevent division by zero
+        self.min_physical_vals = full_train_df.min()
 
     def generate(self, df):
         if self.mean is None:
@@ -76,32 +77,89 @@ class AttributeMatrixGenerator:
         # unsqueeze(1) adds a 'Channel' dimension (B, 1, N, N) required by PyTorch Conv2d layers.
         return torch.stack(matrices).unsqueeze(1), torch.stack(target_values)
 
-class SpatialTemporalTransformer(nn.Module):
+class TemporalAttention(nn.Module):
     """
-    Spatial-Temporal Transformer to replace ConvLSTM.
-    Processes the sequence of spatial correlation matrices in parallel across the temporal dimension.
+    Applies dot-product attention across time. 
+    Purpose: Mitigates the "forgetting" issue of LSTMs by allowing the model to 
+    dynamically assign higher weights to relevant past historical states (windows) 
+    when making the current prediction, capturing long-range dependencies.
     """
-    def __init__(self, channels=64, dim_feedforward=256, nhead=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=nhead, batch_first=True)
-        self.norm1 = nn.LayerNorm(channels)
-        self.norm2 = nn.LayerNorm(channels)
-        self.ffn = nn.Sequential(
-            nn.Linear(channels, dim_feedforward),
-            nn.GELU(),
-            nn.Linear(dim_feedforward, channels)
-        )
+    def __init__(self, hidden_dim):
+        super(TemporalAttention, self).__init__()
+        # Scaling factor for dot-product attention. Prevents extremely large 
+        # values before softmax, which would cause vanishing gradients.
+        self.scale = 5.0 
 
-    def forward(self, sequence_tensor):
-        B, T, C, H, W = sequence_tensor.size()
-        x = sequence_tensor.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
-        attn_out, _ = self.attn(x, x, x)
-        x = self.norm1(x + attn_out)
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + ffn_out)
-        out = x.reshape(B, H, W, T, C).permute(0, 3, 4, 1, 2)
-        return out[:, -1, :, :, :]
+    def forward(self, h_current, h_history):
+        if not h_history:
+            return h_current
+        
+        # Stack history into a single tensor: (History_Length, B, C, H, W)
+        context = torch.stack(h_history, dim=0)
+        b, c, h, w = h_current.size()
+        
+        # Flatten spatial dimensions to compute similarity scores via matrix multiplication
+        flat_curr = h_current.view(b, -1).unsqueeze(1) # Shape: (B, 1, C*H*W)
+        flat_hist = context.view(context.size(0), b, -1).permute(1, 2, 0) # Shape: (B, C*H*W, History_Length)
+        
+        # Calculate similarity scores between the current state and all past states
+        scores = torch.bmm(flat_curr, flat_hist) / self.scale 
+        # Normalize scores into probability weights (0 to 1)
+        weights = F.softmax(scores, dim=-1) 
+        
+        # Compute the context vector as a weighted sum of the historical states
+        weighted_hist = torch.bmm(weights, flat_hist.permute(0, 2, 1))
+        
+        # Reshape back to original spatial dimensions (B, C, H, W)
+        h_hat = weighted_hist.view(b, c, h, w)
+        
+        return h_hat
 
+class ConvLSTMCell(nn.Module):
+    """
+    Convolutional LSTM cell.
+    Purpose: Replaces fully-connected linear layers of a standard LSTM with 2D Convolutions.
+    This is crucial because it preserves the 2D spatial structure (the sensor-to-sensor 
+    correlations in the matrix) while simultaneously learning temporal dynamics.
+    """
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias):
+        super(ConvLSTMCell, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        # Padding ensures the output spatial dimensions (H, W) match the input
+        self.padding = kernel_size // 2
+        
+        # A single convolution layer calculates all 4 LSTM gates at once for efficiency.
+        # The output channel size is 4 * hidden_dim to account for i, f, o, and g gates.
+        self.conv = nn.Conv2d(in_channels=input_dim + hidden_dim,
+                              out_channels=4 * hidden_dim,
+                              kernel_size=kernel_size,
+                              padding=self.padding,
+                              bias=bias)
+
+    def forward(self, input_tensor, cur_state):
+        h_cur, c_cur = cur_state
+        
+        # Concatenate current input matrix and previous hidden state along the channel dimension
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        
+        # Apply convolution to generate raw gate values
+        combined_conv = self.conv(combined)
+        
+        # Split the convolved output into the 4 distinct LSTM gates
+        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
+        
+        # Apply non-linearities: Sigmoid for gates (0 to 1), Tanh for candidate states (-1 to 1)
+        i = torch.sigmoid(cc_i) # Input gate: what new info to keep
+        f = torch.sigmoid(cc_f) # Forget gate: what old info to discard
+        o = torch.sigmoid(cc_o) # Output gate: what to output
+        g = torch.tanh(cc_g)    # Cell candidate: new potential memory
+        
+        # Update cell state (c_next) and hidden state (h_next)
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+        
+        return h_next, c_next
 
 class MSCVAE_Hybrid(nn.Module):
     """
@@ -150,16 +208,19 @@ class MSCVAE_Hybrid(nn.Module):
         val_input_dim = latent_dim + self.flatten_dim
         self.val_decoder = nn.Sequential(
             nn.Linear(val_input_dim, 256),
-            nn.LayerNorm(256),
+            nn.BatchNorm1d(256),
             nn.GELU(),
             nn.Linear(256, 512),
-            nn.LayerNorm(512),
+            nn.BatchNorm1d(512),
             nn.GELU(),
             nn.Linear(512, n_features) 
         )
 
         # Temporal Modeling
-        self.transformer = SpatialTemporalTransformer(channels=64)
+        # ConvLSTM retains the 2D spatial correlations while learning temporal dependencies.
+        # TemporalAttention weighs the importance of the last 5 time steps (max_history).
+        self.clstm = ConvLSTMCell(64, 64, kernel_size=3, bias=True)
+        self.attention = TemporalAttention(hidden_dim=64)
         
         # Convolutional Decoder: Upsamples the combined (Z + Temporal) features back to the original N x N matrix size
         self.dec3 = nn.ConvTranspose2d(64, 32, 3, 2, 1, output_padding=1)
@@ -167,9 +228,7 @@ class MSCVAE_Hybrid(nn.Module):
         self.dec1 = nn.ConvTranspose2d(16, 1, 3, 2, 1, output_padding=1)
         
         # State initialization for temporal modules
-        self.history = []; self.max_history = 5
-        self.log_var_mat = nn.Parameter(torch.zeros(1))
-        self.log_var_val = nn.Parameter(torch.zeros(1))
+        self.h_state = None; self.c_state = None; self.history = []; self.max_history = 5
 
     def reparameterize(self, mu, logvar):
         """
@@ -194,21 +253,26 @@ class MSCVAE_Hybrid(nn.Module):
         z = self.reparameterize(mu, logvar)
         
         # Temporal Modeling
-        if len(self.history) == 0 or self.history[0].size(0) != batch_size:
+        # Initialize hidden states if it's a new batch sequence
+        if self.h_state is None or self.h_state.size(0) != batch_size:
+            h, w = self.spatial_shape[1], self.spatial_shape[2]
+            self.h_state = torch.zeros(batch_size, 64, h, w).to(x.device)
+            self.c_state = torch.zeros(batch_size, 64, h, w).to(x.device)
             self.history = []
 
-        history_tensors = [h for h in self.history]
-        history_tensors.append(e3)
+        # Pass encoded spatial features through ConvLSTM and Attention
+        h_next, c_next = self.clstm(e3, (self.h_state, self.c_state))
+        h_att = self.attention(h_next, self.history)
         
-        seq_tensor = torch.stack(history_tensors, dim=1)
-        h_att = self.transformer(seq_tensor)
-        
-        self.history.append(e3.detach())
+        # Detach states to truncate Backpropagation Through Time (BPTT) and save memory
+        self.h_state = h_att.detach()
+        self.c_state = c_next.detach()
+        self.history.append(self.h_state)
         if len(self.history) > self.max_history: self.history.pop(0)
 
         # Route 1: Raw Values (Hybrid Decoding)
         # Reconstructs values by observing both current correlation (z) and historical context (h_att)
-        flat_h_att = h_att.reshape(batch_size, -1) 
+        flat_h_att = h_att.view(batch_size, -1) 
         z_temporal = torch.cat([z, flat_h_att], dim=1) 
         recon_values = self.val_decoder(z_temporal)
         
@@ -228,24 +292,33 @@ class MSCVAE_Hybrid(nn.Module):
 
         return recon_matrix, recon_values, mu, logvar
 
-    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, beta=0.6):
-        n_elements_matrix = x_matrix.shape[2] * x_matrix.shape[3] 
-        
+    def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, alpha=5.0, beta=0.6):
+        """
+        Multitask Loss Function (Beta-VAE framework).
+        """
+        # Calculate base mean squared errors
         mse_mat_mean = F.mse_loss(recon_matrix, x_matrix, reduction='mean')
         mse_val_mean = F.mse_loss(recon_values, x_values, reduction='mean')
+        
+        # Dimensionality Balancing: 
+        # A matrix has N*N elements, while the value vector has only N.
+        # Multiplying the 'mean' error by N*N simulates a 'sum' reduction, ensuring that the
+        # magnitude of the reconstruction loss is mathematically aligned with the KLD (which uses sum).
+        n_elements_matrix = x_matrix.shape[2] * x_matrix.shape[3] 
         
         MSE_Mat_scaled = mse_mat_mean * n_elements_matrix
         MSE_Val_scaled = mse_val_mean * n_elements_matrix 
         
-        precision_mat = torch.exp(-self.log_var_mat)
-        loss_mat = precision_mat * MSE_Mat_scaled + self.log_var_mat
-
-        precision_val = torch.exp(-self.log_var_val)
-        loss_val = precision_val * MSE_Val_scaled + self.log_var_val
-
+        # KLD (Kullback-Leibler Divergence) acts as a regularizer, forcing the latent space 
+        # to approximate a standard normal distribution. Prevents overfitting.
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-        total_loss = loss_mat + loss_val + (beta * KLD)
+        # Total Loss Calculation:
+        # alpha: Weighs the importance of reconstructing raw values vs matrices (Hybrid balance).
+        # beta: Controls the strength of the KLD regularizer (Beta-VAE technique). Lower beta (<1) 
+        # prevents 'Posterior Collapse', giving the model more freedom to focus on reconstruction accuracy.
+        total_loss = MSE_Mat_scaled + (alpha * MSE_Val_scaled) + (beta * KLD)
+        
         return total_loss
 
 class SPOT:
@@ -587,27 +660,20 @@ class MSCVAE:
         self.model.train()
         if verbose: print(f"Starting training on {self.device} for {epochs} epochs...")
         
-        def calculate_beta_annealing(epoch, max_epochs):
-            cycle_length = max(1, max_epochs // 4)
-            return min(1.0, (epoch % cycle_length) / (cycle_length * 0.5))
-
         for epoch in range(epochs):
             epoch_start_time = time.time()
             total_loss = 0
-            beta_val = calculate_beta_annealing(epoch, epochs)
-            
             for batch_matrix, batch_values in train_loader:
                 x_mat = batch_matrix.to(self.device)
                 x_val = batch_values.to(self.device)
                 
+                # Standard PyTorch Backprop Loop
                 optimizer.zero_grad()
                 recon_mat, recon_val, mu, logvar = self.model(x_mat)
                 
-                loss = self.model.loss_function(recon_mat, x_mat, recon_val, x_val, mu, logvar, beta=beta_val)
+                # Calculates multitask loss (Matrix MSE + Value MSE + KLD Regularization)
+                loss = self.model.loss_function(recon_mat, x_mat, recon_val, x_val, mu, logvar)
                 loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
                 optimizer.step()
                 total_loss += loss.item()
             epoch_duration = time.time() - epoch_start_time
@@ -649,6 +715,8 @@ class MSCVAE:
         
         with torch.no_grad():
             # Reset temporal states to prevent leakage between completely different inferences
+            self.model.h_state = None
+            self.model.c_state = None
             self.model.history = []
             
             for (batch_input,) in loader:
@@ -693,6 +761,9 @@ class MSCVAE:
             raise ValueError("Model not trained. Call .fit() first!")
 
         self.model.eval()
+
+        # Filter columns to match the generator's expected features
+        df_test = df_test[self.generator.mean.index]
         
         # Transform raw test data into correlation matrices
         try:
@@ -763,6 +834,9 @@ class MSCVAE:
             raise ValueError("Model not trained. Call .fit() first!")
         
         self.model.eval()
+
+        # Filter columns to match the generator's expected features
+        df_test = df_test[self.generator.mean.index]
         
         # Generate spatial-temporal matrices and target values from the raw dataframe
         try:
@@ -784,6 +858,8 @@ class MSCVAE:
         reconstructed_vals = []
         
         with torch.no_grad():
+            self.model.h_state = None
+            self.model.c_state = None
             self.model.history = []
             
             for batch_mat, batch_val in loader:
@@ -810,14 +886,15 @@ class MSCVAE:
                 original_vals.extend(vals.cpu().numpy())
                 reconstructed_vals.extend(recon_val.cpu().numpy())
 
-        precision_mat = torch.exp(-self.model.log_var_mat).item()
-        precision_val = torch.exp(-self.model.log_var_val).item()
-
+        # Score Processing & Dimensional Balance
+        # Summing dim=1 aggregates the correlation error of sensor 'i' with all other sensors
         mat_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
         val_scores = total_error_val.cpu().numpy()
         
+        # Dimensional balance: A matrix row has N elements, the value has 1. 
+        # We multiply by N so the value error holds equal voting weight in the final score.
         val_scores_scaled = val_scores * n_features
-        variable_scores = (mat_scores * precision_mat) + (val_scores_scaled * precision_val)
+        variable_scores = mat_scores + (alpha * val_scores_scaled)
         
         variable_names = self.generator.mean.index
         total_period_error = np.sum(variable_scores)
@@ -869,14 +946,24 @@ class MSCVAE:
         
         contributions_dict = df_contrib.to_dict()
 
-        # Denormalize reconstructed values (apply Z-score backwards) so they can be 
-        # plotted alongside the real physical values in a dashboard.
+        # Denormalize reconstructed values (apply Z-score backwards)
         recon_arr = np.array(reconstructed_vals)
         recon_data = {}
         for i, col in enumerate(variable_names):
             mean = self.generator.mean[col]
             std = self.generator.std[col]
+            
+            # Get the physical lower bound learned by the generator
+            physical_min = self.generator.min_physical_vals[col]
+            
             rec_real = (recon_arr[:, i] * std) + mean
+            
+            # Smooth Clipping (Hyperbolic Soft Maximum)
+            # Prevents flatlining at 0.0 while maintaining a strict physical floor and signal noise
+            L = 0.0 if physical_min >= 0.0 else physical_min
+            gamma = 0.05 # Curvature factor. Kept small to maintain precision.
+            rec_real = (rec_real + L + np.sqrt((rec_real - L)**2 + gamma)) / 2.0
+            
             recon_data[f"{col}"] = rec_real
             
         reconstruction_df = pd.DataFrame(recon_data)
