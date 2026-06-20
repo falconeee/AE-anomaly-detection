@@ -909,3 +909,156 @@ class MSCVAE:
             reconstruction_df.reset_index(inplace=True)
         
         return contributions_dict, reconstruction_df
+
+    def contribution_top_k(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0, top_k=10):
+        """
+        Root Cause Analysis (RCA) pipeline.
+        Identifies exactly the top_k sensors that caused the anomaly by measuring 
+        their individual reconstruction errors. Combines spatial correlation errors 
+        (matrices) and raw magnitude errors (values).
+        """
+        if self.model is None:
+            raise ValueError("Model not trained. Call .fit() first!")
+        
+        self.model.eval()
+
+        # Filter columns to match the generator's expected features
+        df_test = df_test[self.generator.mean.index]
+        
+        # Generate spatial-temporal matrices and target values from the raw dataframe
+        try:
+            tensor_matrices, tensor_values = self.generator.generate(df_test)
+        except ValueError as e:
+            raise ValueError(f"Generation error: {e}")
+            
+        if tensor_matrices.nelement() == 0:
+            raise ValueError("No matrices generated from input dataframe!")
+
+        loader = DataLoader(TensorDataset(tensor_matrices, tensor_values), batch_size=batch_size, shuffle=False)
+        n_features = tensor_matrices.shape[2]
+        
+        # Error accumulators for each individual feature (sensor)
+        total_error_matrix = torch.zeros(n_features, n_features).to(self.device)
+        total_error_val = torch.zeros(n_features).to(self.device)
+        
+        reconstructed_vals = []
+        
+        with torch.no_grad():
+            self.model.h_state = None
+            self.model.c_state = None
+            self.model.history = []
+            
+            for batch_mat, batch_val in loader:
+                inputs = batch_mat.to(self.device).float()
+                vals = batch_val.to(self.device).float()
+                
+                recon_matrix, recon_val, _, _ = self.model(inputs)
+                
+                if inputs.dim() == 4:
+                    diff_mat = inputs - recon_matrix
+                    batch_error_mat = torch.pow(diff_mat, 2).squeeze(1)
+                else:
+                    batch_error_mat = torch.pow(inputs - recon_matrix, 2)
+                    
+                total_error_matrix += torch.sum(batch_error_mat, dim=0)
+                
+                batch_error_val = torch.pow(vals - recon_val, 2)
+                total_error_val += torch.sum(batch_error_val, dim=0)
+                
+                # CORREÇÃO AQUI: append em vez de extend mantém as dimensões intactas (B, N)
+                reconstructed_vals.append(recon_val.cpu().numpy())
+
+        del tensor_matrices, tensor_values, loader
+        import gc
+        gc.collect()
+
+        # Score Processing & Dimensional Balance
+        mat_scores = torch.sum(total_error_matrix, dim=1).cpu().numpy()
+        val_scores = total_error_val.cpu().numpy()
+        
+        val_scores_scaled = val_scores * n_features
+        variable_scores = mat_scores + (alpha * val_scores_scaled)
+        
+        variable_names = self.generator.mean.index
+        total_period_error = np.sum(variable_scores)
+        
+        contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
+
+        # Assemble the raw contribution DataFrame
+        df_contrib = pd.DataFrame({
+            'VARIAVEL': variable_names,
+            'score': variable_scores,
+            '%': contrib_pct
+        })
+        
+        df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC', 'SISTEMA']], on='VARIAVEL', how='left')
+        df_contrib['DESC'] = df_contrib['DESC'].fillna('NoDesc')
+        df_contrib['SISTEMA'] = df_contrib['SISTEMA'].fillna('NoSystem')
+        
+        df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
+
+        # CORTE FIXO: Retorna as Top K variáveis
+        df_contrib = df_contrib.head(top_k).copy()
+
+        # Recalcula os percentuais apenas para as Top K filtradas
+        if df_contrib['score'].sum() > 0:
+            df_contrib['%'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
+        else:
+            df_contrib['%'] = 0.0
+
+        df_contrib.index = df_contrib.index.astype(str)
+        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%']]
+        
+        contributions_dict = df_contrib.to_dict()
+
+        # Denormalization & Soft Clipping
+        recon_arr = np.concatenate(reconstructed_vals, axis=0)
+        del reconstructed_vals
+        
+        means = self.generator.mean.values
+        stds = self.generator.std.values
+        
+        phys_mins = np.array([self.generator.min_physical_vals.get(col, 0.0) for col in variable_names])
+        
+        recon_arr = (recon_arr * stds) + means
+        
+        L = np.where(phys_mins >= 0.0, 0.0, phys_mins)
+        gamma = 0.05 
+        recon_arr = (recon_arr + L + np.sqrt((recon_arr - L)**2 + gamma)) / 2.0
+        
+        reconstruction_df = pd.DataFrame(recon_arr, columns=variable_names)
+        del recon_arr 
+        gc.collect()
+        
+        # Filtra as colunas reconstruídas para enviar apenas as Top K principais ao painel
+        top_k_vars = df_contrib['VARIAVEL'].tolist()
+        reconstruction_df = reconstruction_df[top_k_vars].copy()
+        
+        # Align sliding window predictions back to their exact original timestamps
+        if timestamps is not None:
+            w = self.generator.w
+            s = self.generator.step
+            
+            if hasattr(timestamps, 'values'):
+                ts_values = timestamps.values
+            else:
+                ts_values = np.array(timestamps)
+                
+            valid_indices = [t - 1 for t in range(w, len(df_test) + 1, s)]
+            min_len = min(len(reconstruction_df), len(valid_indices))
+            reconstruction_df = reconstruction_df.iloc[:min_len].copy()
+            valid_indices = valid_indices[:min_len]
+            
+            aligned_timestamps = []
+            for idx in valid_indices:
+                if idx < len(ts_values):
+                    aligned_timestamps.append(ts_values[idx])
+                else:
+                    if len(aligned_timestamps) > 0:
+                        aligned_timestamps.append(aligned_timestamps[-1])
+            
+            reconstruction_df.index = aligned_timestamps
+            reconstruction_df.index.name = 'timestamp'
+            reconstruction_df.reset_index(inplace=True)
+        
+        return contributions_dict, reconstruction_df
