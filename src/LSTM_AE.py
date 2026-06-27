@@ -135,17 +135,22 @@ class LSTM_Autoencoder(nn.Module):
             hidden_size=hidden_dim, 
             batch_first=True
         )
+        self.dropout = nn.Dropout(dropout_rate)
         self.encoder_l2 = nn.LSTM(
             input_size=hidden_dim, 
             hidden_size=hidden_dim // 2, 
             batch_first=True
         )
-        self.dropout = nn.Dropout(dropout_rate)
         
         # --- Decoder ---
         self.decoder_l1 = nn.LSTM(
             input_size=hidden_dim // 2, 
-            hidden_size=hidden_dim, 
+            hidden_size=hidden_dim // 2, 
+            batch_first=True
+        )
+        self.decoder_l2 = nn.LSTM(
+            input_size=hidden_dim // 2,
+            hidden_size=hidden_dim,
             batch_first=True
         )
         
@@ -159,15 +164,16 @@ class LSTM_Autoencoder(nn.Module):
         x, _ = self.encoder_l1(x)
         x = self.dropout(x)
         
-        _, (hidden, _) = self.encoder_l2(x)
-        latent = hidden[-1] # Extrai o último estado oculto: [batch, hidden_dim // 2]
+        _, (hidden, cell) = self.encoder_l2(x)
         
         # Repeat Vector: Repete o vetor latente no tempo
+        latent = hidden[-1]
         decoder_input = latent.unsqueeze(1).repeat(1, self.seq_len, 1) # [batch, seq_len, hidden_dim // 2]
         
-        # Decoder Pass
-        x, _ = self.decoder_l1(decoder_input)
+        # Decoder Pass (passando hidden e cell state para a memória contextual)
+        x, _ = self.decoder_l1(decoder_input, (hidden, cell))
         x = self.dropout(x)
+        x, _ = self.decoder_l2(x)
         
         # Reconstrução
         reconstruction = self.output_layer(x) # [batch, seq_len, features]
@@ -195,6 +201,7 @@ class LSTM_AE:
         self.gain = 1.0
         self.n_features = None
         self.feature_names = None
+        self.baseline_errors = None
 
     def set_deterministic(self, seed):
         random.seed(seed)
@@ -325,6 +332,25 @@ class LSTM_AE:
         self.threshold = base_threshold * self.gain
         print(f"Limiar de Anomalia Final (SPOT * Gain): {self.threshold:.6f}")
 
+        print("Calculando perfil de erro baseline por variável...")
+        self.baseline_errors = self._get_baseline_feature_errors(tensor_data)
+
+    def _get_baseline_feature_errors(self, data_tensor, batch_size=128):
+        """Calcula o erro médio absoluto BASE (normal) por variável."""
+        self.model.eval()
+        total_error = torch.zeros(self.n_features).to(self.device)
+        total_samples = 0
+        loader = DataLoader(TensorDataset(data_tensor), batch_size=batch_size, shuffle=False)
+        with torch.no_grad():
+            for (inputs,) in loader:
+                inputs = inputs.to(self.device)
+                recon = self.model(inputs)
+                # Usa MAE focando apenas no último passo temporal (evita overlap)
+                batch_error = torch.mean(torch.abs(inputs[:, -1, :] - recon[:, -1, :]), dim=0)
+                total_error += batch_error * inputs.size(0)
+                total_samples += inputs.size(0)
+        return (total_error / total_samples).cpu().numpy()
+
     def predict(self, df_test, timestamps=None, batch_size=128):
         """
         Inference pipeline for new unseen data.
@@ -387,9 +413,10 @@ class LSTM_AE:
     def contribution(self, df_anomaly, timestamps=None, df_sistema=None, batch_size=32):
         """
         Análise de Causa Raiz: Calcula o erro de reconstrução individual por variável usando
-        MSE e aplica o método MAD para isolar o sensor culpado da anomalia.
+        o Aumento Relativo do erro de reconstrução isolando o sensor culpado da anomalia.
         """
         if self.model is None: raise ValueError("Execute .fit() primeiro.")
+        if self.baseline_errors is None: raise ValueError("O baseline de erros não foi calculado no fit().")
         
         data_scaled = self.scaler.transform(df_anomaly.values)
         windows = self._reshape_data(data_scaled)
@@ -398,6 +425,7 @@ class LSTM_AE:
         loader = DataLoader(TensorDataset(torch.tensor(windows, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
         
         total_error_val = torch.zeros(self.n_features).to(self.device)
+        total_samples = 0
         reconstructed_vals_last_step = []
         
         self.model.eval()
@@ -406,21 +434,30 @@ class LSTM_AE:
                 inputs = inputs.to(self.device)
                 recon = self.model(inputs)
                 
-                # Erro quadrático médio (MSE) por variável ao longo da janela e do batch
-                batch_error = torch.pow(inputs - recon, 2)
-                total_error_val += torch.sum(batch_error, dim=[0, 1])
+                # Consistente com baseline: pega apenas o último timestep para evitar overlap enviesado
+                batch_error_last_step = torch.abs(inputs[:, -1, :] - recon[:, -1, :])
+                total_error_val += torch.sum(batch_error_last_step, dim=0)
+                total_samples += inputs.size(0)
                 
                 # Guarda apenas o último timestep de cada janela para a reconstrução temporal
                 reconstructed_vals_last_step.extend(recon[:, -1, :].cpu().numpy())
 
-        # 1. Pipeline de Causa Raiz (MAD)
-        variable_scores = total_error_val.cpu().numpy()
-        total_period_error = np.sum(variable_scores)
-        contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
+        # 1. Pipeline de Causa Raiz: Aumento Relativo (%) em relação ao esperado
+        mean_anomaly_error = (total_error_val / total_samples).cpu().numpy()
+        
+        # Qual variável fugiu mais do seu "normal"? 
+        # Ex: se o erro da var A era 0.001 e foi para 0.01 -> score de 9.0 (+900% de aumento)
+        relative_increase = (mean_anomaly_error - self.baseline_errors) / (self.baseline_errors + 1e-8)
+        
+        # Trata casos em que a variável reconstruiu melhor na anomalia do que no treino
+        relative_increase = np.maximum(0, relative_increase)
+        
+        total_relative_score = np.sum(relative_increase)
+        contrib_pct = (relative_increase / total_relative_score * 100) if total_relative_score > 0 else np.zeros_like(relative_increase)
 
         df_contrib = pd.DataFrame({
             'VARIAVEL': self.feature_names,
-            'score': variable_scores,
+            'score': relative_increase, # Substitui o score puro pelo multiplicador de agravamento
             '%': contrib_pct
         })
         
@@ -433,12 +470,8 @@ class LSTM_AE:
             
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # Filtro MAD (Median Absolute Deviation)
-        median_score = df_contrib['score'].median()
-        mad = (df_contrib['score'] - median_score).abs().median()
-        mad_threshold = median_score + (1.4826 * mad)
-        
-        df_contrib_filtered = df_contrib[df_contrib['score'] > mad_threshold].copy()
+        # Filtro de aumento (ex: > 0.5 equivale a >50% pior que o normal)
+        df_contrib_filtered = df_contrib[df_contrib['score'] > 0.5].copy()
         
         # Fallback
         if len(df_contrib_filtered) == 0:

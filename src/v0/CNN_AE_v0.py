@@ -5,11 +5,15 @@ import random
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import MinMaxScaler
 from scipy.optimize import minimize
 
+# ==========================================
+# 1. Algoritmo SPOT (Teoria de Valores Extremos)
+# ==========================================
 class SPOT:
     """
     Calcula limiares de anomalia baseados na Teoria de Valores Extremos (EVT).
@@ -115,62 +119,97 @@ class SPOT:
         return self.init_threshold - sigma * math.log(r)
 
 
-class AE_Model(nn.Module):
-    def __init__(self, seq_len=60, n_features=3, latent_dim=32):
-        super(AE_Model, self).__init__()
+# ==========================================
+# 2. Arquitetura CNN Autoencoder
+# ==========================================
+class OptimizedCNN_Autoencoder(nn.Module):
+    def __init__(self, seq_len=60, n_features=3, dropout_rate=0.1):
+        super(OptimizedCNN_Autoencoder, self).__init__()
         self.seq_len = seq_len
         self.n_features = n_features
-        self.input_dim = seq_len * n_features
-        
+
+        # --- ENCODER ---
         self.encoder = nn.Sequential(
-            nn.Linear(self.input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
+            nn.Conv1d(in_channels=n_features, out_channels=64, kernel_size=15, stride=3, padding=7),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Linear(64, latent_dim)
+            nn.Dropout(dropout_rate),
+            
+            nn.Conv1d(64, 32, kernel_size=9, stride=2, padding=4),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            
+            nn.Conv1d(32, 16, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(16),
+            nn.GELU(),
+            
+            nn.Conv1d(16, 8, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(8),
+            nn.GELU(),
+            
+            nn.MaxPool1d(kernel_size=2, stride=2)
         )
-        
+
+        # --- DECODER ---
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64),
+            nn.ConvTranspose1d(8, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm1d(16),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            
+            nn.ConvTranspose1d(16, 32, kernel_size=7, stride=2, padding=3, output_padding=1),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            
+            nn.ConvTranspose1d(32, 64, kernel_size=9, stride=2, padding=4, output_padding=1),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 128),
-            nn.BatchNorm1d(128),
+            
+            nn.ConvTranspose1d(64, 64, kernel_size=15, stride=3, padding=7, output_padding=1),
+            nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Linear(128, self.input_dim)
+            
+            # Camada Final: Reconstrói as features originais
+            nn.Conv1d(64, n_features, kernel_size=1, stride=1)
         )
 
     def forward(self, x):
-        batch_size = x.size(0)
-        x_flat = x.view(batch_size, -1)
-        latent = self.encoder(x_flat)
-        reconstruction_flat = self.decoder(latent)
-        return reconstruction_flat.view(batch_size, self.seq_len, self.n_features)
+        # Transpor para formato CNN: [batch, features, seq_len]
+        x = x.permute(0, 2, 1)
+        
+        # Autoencoder Pass
+        latent = self.encoder(x)
+        reconstruction = self.decoder(latent)
+        
+        # Ajuste Fino de Tamanho: garante que a saída tenha exatamente seq_len
+        if reconstruction.shape[2] != self.seq_len:
+            reconstruction = F.interpolate(reconstruction, size=self.seq_len, mode='linear', align_corners=False)
+        
+        # Transpor de volta para formato LSTM/Padrão: [batch, seq_len, features]
+        reconstruction = reconstruction.permute(0, 2, 1)
+        
+        return reconstruction
 
 
-class ANN_AE:
-    def __init__(self, seq_len=60, stride=1, latent_dim=32, device=None, seed=42):
+# ==========================================
+# 3. Orquestrador do Modelo (Pipeline)
+# ==========================================
+class CNN_AE:
+    def __init__(self, seq_len=60, stride=1, device=None, seed=42):
         self.seq_len = seq_len
         self.stride = stride
-        self.latent_dim = latent_dim
         self.seed = seed
         
         self.set_deterministic(self.seed)
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         print(f"Using device: {self.device}")
-        
-        self.scaler = RobustScaler()
+
+        self.scaler = MinMaxScaler()
         self.model = None
         self.threshold = None
         self.gain = 1.0
         self.n_features = None
         self.feature_names = None
-        self.train_error_mean = None
-        self.train_error_std = None
 
     def set_deterministic(self, seed):
         random.seed(seed)
@@ -178,9 +217,8 @@ class ANN_AE:
         torch.manual_seed(seed)
         if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-    def _reshape_data(self, data, stride=None):
-        current_stride = stride if stride is not None else self.stride
-        return np.array([data[i:(i + self.seq_len)] for i in range(0, len(data) - self.seq_len + 1, current_stride)])
+    def _reshape_data(self, data):
+        return np.array([data[i:(i + self.seq_len)] for i in range(0, len(data) - self.seq_len + 1, self.stride)])
 
     def _get_anomaly_scores(self, data_tensor, batch_size=128):
         """Calcula o erro de reconstrução MAE por janela para uso no SPOT."""
@@ -191,6 +229,7 @@ class ANN_AE:
             for (inputs,) in loader:
                 inputs = inputs.to(self.device)
                 reconstructions = self.model(inputs)
+                # Erro médio absoluto sobre as features e a sequência
                 batch_loss = torch.mean(torch.abs(reconstructions - inputs), dim=[1, 2])
                 scores.extend(batch_loss.cpu().numpy())
         return np.array(scores)
@@ -208,50 +247,45 @@ class ANN_AE:
                 lms *= 0.999 # Diminui o rigor se falhar ao ajustar a curva de Pareto
         return s.extreme_quantile
 
-    def fit(self, df_train, epochs=100, batch_size=128, lr=1e-3, patience=20, val_split=0.1, gain=1.0, train_stride=None):
+    def fit(self, df_train, epochs=100, batch_size=128, lr=1e-3, patience=20, val_split=0.1, gain=1.0):
         self.gain = gain
         
-        # Se não definido, usa metade da janela para reduzir sobreposição e tempo de treino
-        current_train_stride = train_stride if train_stride is not None else max(1, self.seq_len // 2)
-
-        # 1. Padroniza a entrada para ser sempre uma lista
+        # Padroniza a entrada para ser sempre uma lista
         if isinstance(df_train, pd.DataFrame) or isinstance(df_train, np.ndarray):
             df_train = [df_train]
             
-        # 2. Extrai metadados do primeiro dataframe
         first_df = df_train[0]
         self.n_features = first_df.shape[1]
         self.feature_names = first_df.columns.tolist() if isinstance(first_df, pd.DataFrame) else [f"Var_{i}" for i in range(self.n_features)]
         
-        # 3. Treina o Scaler globalmente com todos os dados
+        # Treina o Scaler globalmente
         if isinstance(first_df, pd.DataFrame):
             full_data = pd.concat(df_train, ignore_index=True).values
         else:
             full_data = np.vstack(df_train)
         self.scaler.fit(full_data)
         
-        # 4. Escala e gera janelas isoladamente para cada período
+        # Escala e gera janelas isoladamente
         all_windows = []
         for df in df_train:
             vals = df.values if isinstance(df, pd.DataFrame) else df
             data_scaled = self.scaler.transform(vals)
-            windows = self._reshape_data(data_scaled, stride=current_train_stride)
+            windows = self._reshape_data(data_scaled)
             if len(windows) > 0:
                 all_windows.append(windows)
                 
         if not all_windows:
             raise ValueError("Os dataframes são menores que o seq_len. Nenhuma janela foi gerada.")
             
-        # Concatena as janelas finais
         final_windows = np.concatenate(all_windows, axis=0)
         tensor_data = torch.tensor(final_windows, dtype=torch.float32)
         
-        # 5. Restante do pipeline permanece inalterado
+        # Configuração do Treino
         split_idx = int((1 - val_split) * len(tensor_data))
         train_loader = DataLoader(TensorDataset(tensor_data[:split_idx]), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(TensorDataset(tensor_data[split_idx:]), batch_size=batch_size, shuffle=False)
         
-        self.model = AE_Model(self.seq_len, self.n_features, self.latent_dim).to(self.device)
+        self.model = OptimizedCNN_Autoencoder(self.seq_len, self.n_features).to(self.device)
         criterion = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
         
@@ -259,6 +293,7 @@ class ANN_AE:
         patience_counter = 0
         best_model_state = None
 
+        print(f"Treinando CNN-AE no dispositivo: {self.device}...")
         for epoch in range(1, epochs + 1):
             self.model.train()
             train_loss = 0
@@ -296,29 +331,6 @@ class ANN_AE:
                 
         self.model.load_state_dict(best_model_state)
         
-        # Cálculo do Baseline de Erro por Variável para Análise de Causa Raiz
-        print("Calculando baseline de reconstrução por variável...")
-        self.model.eval()
-        with torch.no_grad():
-            all_recon = []
-            all_inputs = []
-            full_loader = DataLoader(TensorDataset(tensor_data), batch_size=batch_size, shuffle=False)
-            for (inps,) in full_loader:
-                inps = inps.to(self.device)
-                recs = self.model(inps)
-                all_recon.append(recs.cpu())
-                all_inputs.append(inps.cpu())
-            
-            all_recon = torch.cat(all_recon, dim=0)
-            all_inputs = torch.cat(all_inputs, dim=0)
-            
-            # MAE médio por janela para cada variável
-            feature_errors = torch.mean(torch.abs(all_inputs - all_recon), dim=1)
-            
-            self.train_error_mean = feature_errors.mean(dim=0).numpy()
-            self.train_error_std = feature_errors.std(dim=0).numpy()
-            self.train_error_std[self.train_error_std == 0] = 1e-8
-        
         # Cálculo Dinâmico do Threshold com SPOT
         print("Calculando limiar dinâmico (SPOT)...")
         train_scores = self._get_anomaly_scores(tensor_data)
@@ -336,7 +348,6 @@ class ANN_AE:
 
         self.model.eval()
         
-        # Transformação dos dados de teste
         try:
             data_scaled = self.scaler.transform(df_test.values)
             windows = self._reshape_data(data_scaled)
@@ -348,33 +359,25 @@ class ANN_AE:
             print(f"Dataframe de teste muito pequeno para a janela de tamanho {self.seq_len}.")
             return {}
             
-        # Obtém o score de anomalia (erro de reconstrução absoluto/MSE)
         tensor_windows = torch.tensor(windows, dtype=torch.float32)
         all_scores = self._get_anomaly_scores(tensor_windows, batch_size=batch_size)
         
-        # Alinhamento Temporal (Time Alignment)
-        # O score calculado representa o estado do sistema no *final* daquela janela.
         w = self.seq_len
         s = self.stride
         
         if timestamps is not None:
             ts_values = timestamps.values if hasattr(timestamps, 'values') else np.array(timestamps)
                 
-            # Mapeia os índices correspondentes ao último timestamp de cada janela gerada
             valid_indices = [i + w - 1 for i in range(0, len(df_test) - w + 1, s)]
-            
-            # Trunca para evitar IndexError em caso de divergências de dimensão
             min_len = min(len(all_scores), len(valid_indices))
             final_scores = all_scores[:min_len]
             final_indices = valid_indices[:min_len]
             
             final_timestamps = []
             for idx in final_indices:
-                # Proteção básica para index fora dos limites
                 if idx < len(ts_values):
                      final_timestamps.append(ts_values[idx])
                 elif idx == len(ts_values):
-                    # Se bater exatamente no limite, pega o último timestamp disponível
                     final_timestamps.append(ts_values[-1])
             
             final_scores = final_scores[:len(final_timestamps)]
@@ -384,7 +387,6 @@ class ANN_AE:
                 'phi': final_scores.tolist()
             }
         else:
-            # Timestamps fictícios caso nenhum seja fornecido
             return {
                 'timestamp': np.arange(len(all_scores)).tolist(),
                 'phi': all_scores.tolist()
@@ -392,21 +394,18 @@ class ANN_AE:
 
     def contribution(self, df_anomaly, timestamps=None, df_sistema=None, batch_size=32):
         """
-        Análise de Causa Raiz: Calcula o erro de reconstrução individual por variável (MAE) e
-        aplica Z-Score histórico para identificar exatamente os sensores que mais desviaram do normal.
-        Retorna o dicionário de contribuições e o DataFrame dos dados reconstruídos desnormalizados.
+        Análise de Causa Raiz: Calcula o erro de reconstrução individual por variável usando
+        MSE e aplica o método MAD para isolar o sensor culpado da anomalia.
         """
         if self.model is None: raise ValueError("Execute .fit() primeiro.")
-        if getattr(self, 'train_error_mean', None) is None: raise ValueError("Modelo precisa ser retreinado para calcular os baselines históricos.")
         
         data_scaled = self.scaler.transform(df_anomaly.values)
-        windows = self._reshape_data(data_scaled, stride=1)
+        windows = self._reshape_data(data_scaled)
         if len(windows) == 0: raise ValueError("Dados insuficientes para formar uma janela.")
             
         loader = DataLoader(TensorDataset(torch.tensor(windows, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
         
         total_error_val = torch.zeros(self.n_features).to(self.device)
-        total_timesteps = 0
         reconstructed_vals_last_step = []
         
         self.model.eval()
@@ -415,26 +414,18 @@ class ANN_AE:
                 inputs = inputs.to(self.device)
                 recon = self.model(inputs)
                 
-                # Erro absoluto (MAE)
-                batch_error = torch.abs(inputs - recon)
+                batch_error = torch.pow(inputs - recon, 2)
                 total_error_val += torch.sum(batch_error, dim=[0, 1])
-                total_timesteps += inputs.size(0) * inputs.size(1)
-                
-                # Guarda apenas o último timestep de cada janela para a reconstrução temporal
                 reconstructed_vals_last_step.extend(recon[:, -1, :].cpu().numpy())
 
-        mean_anomaly_error = (total_error_val / total_timesteps).cpu().numpy()
-
-        # 1. Pipeline de Causa Raiz (Z-Score Histórico)
-        z_scores = (mean_anomaly_error - self.train_error_mean) / self.train_error_std
-        z_scores = np.maximum(z_scores, 0) # Ignoramos melhoras na reconstrução
-        
-        total_z = np.sum(z_scores)
-        contrib_pct = (z_scores / total_z * 100) if total_z > 0 else np.zeros_like(z_scores)
+        # 1. Pipeline de Causa Raiz (MAD)
+        variable_scores = total_error_val.cpu().numpy()
+        total_period_error = np.sum(variable_scores)
+        contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
         df_contrib = pd.DataFrame({
             'VARIAVEL': self.feature_names,
-            'score': z_scores,
+            'score': variable_scores,
             '%': contrib_pct
         })
         
@@ -447,10 +438,12 @@ class ANN_AE:
             
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # Filtro: Isolamos variáveis com Z-score > 2 (mais de 2 desvios padrões fora do normal)
-        df_contrib_filtered = df_contrib[df_contrib['score'] > 2.0].copy()
+        median_score = df_contrib['score'].median()
+        mad = (df_contrib['score'] - median_score).abs().median()
+        mad_threshold = median_score + (1.4826 * mad)
         
-        # Fallback: Se nenhuma variável superar o threshold estatístico, mostra as top 3
+        df_contrib_filtered = df_contrib[df_contrib['score'] > mad_threshold].copy()
+        
         if len(df_contrib_filtered) == 0:
             df_contrib_filtered = df_contrib.head(3).copy()
 
@@ -461,15 +454,13 @@ class ANN_AE:
 
         # 2. Pipeline de Reconstrução Desnormalizada
         recon_arr = np.array(reconstructed_vals_last_step)
-        # Inverte o Z-score/MinMax para a grandeza física original
         recon_real = self.scaler.inverse_transform(recon_arr)
         
         reconstruction_df = pd.DataFrame(recon_real, columns=self.feature_names)
         
-        # Alinha os timestamps com os dados reconstruídos
         if timestamps is not None:
             ts_values = timestamps.values if hasattr(timestamps, 'values') else np.array(timestamps)
-            valid_timestamps = ts_values[self.seq_len - 1 :: 1] # inferência sempre com stride=1
+            valid_timestamps = ts_values[self.seq_len - 1 :: self.stride]
             min_len = min(len(reconstruction_df), len(valid_timestamps))
             
             reconstruction_df = reconstruction_df.iloc[:min_len].copy()

@@ -11,6 +11,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import MinMaxScaler
 from scipy.optimize import minimize
 
+try:
+    from captum.attr import IntegratedGradients
+    HAS_CAPTUM = True
+except ImportError:
+    HAS_CAPTUM = False
+
 # ==========================================
 # 1. Algoritmo SPOT (Teoria de Valores Extremos)
 # ==========================================
@@ -152,7 +158,7 @@ class OptimizedCNN_Autoencoder(nn.Module):
 
         # --- DECODER ---
         self.decoder = nn.Sequential(
-            nn.ConvTranspose1d(8, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ConvTranspose1d(8, 16, kernel_size=3, stride=2, padding=0, output_padding=0),
             nn.BatchNorm1d(16),
             nn.GELU(),
             nn.Dropout(dropout_rate),
@@ -165,7 +171,7 @@ class OptimizedCNN_Autoencoder(nn.Module):
             nn.BatchNorm1d(64),
             nn.GELU(),
             
-            nn.ConvTranspose1d(64, 64, kernel_size=15, stride=3, padding=7, output_padding=1),
+            nn.ConvTranspose1d(64, 64, kernel_size=15, stride=3, padding=7, output_padding=2),
             nn.BatchNorm1d(64),
             nn.GELU(),
             
@@ -181,7 +187,7 @@ class OptimizedCNN_Autoencoder(nn.Module):
         latent = self.encoder(x)
         reconstruction = self.decoder(latent)
         
-        # Ajuste Fino de Tamanho: garante que a saída tenha exatamente seq_len
+        # Ajuste Fino de Tamanho: caso seq_len != 60 seja usado e a matemática não feche, faz um fallback
         if reconstruction.shape[2] != self.seq_len:
             reconstruction = F.interpolate(reconstruction, size=self.seq_len, mode='linear', align_corners=False)
         
@@ -394,32 +400,56 @@ class CNN_AE:
 
     def contribution(self, df_anomaly, timestamps=None, df_sistema=None, batch_size=32):
         """
-        Análise de Causa Raiz: Calcula o erro de reconstrução individual por variável usando
-        MSE e aplica o método MAD para isolar o sensor culpado da anomalia.
+        Análise de Causa Raiz com Explainable AI (Captum/Integrated Gradients):
+        Calcula qual variável na entrada mais contribuiu para elevar o Anomaly Score final.
         """
         if self.model is None: raise ValueError("Execute .fit() primeiro.")
         
+        if not HAS_CAPTUM:
+            raise ImportError("A biblioteca 'captum' é necessária para a RCA de Nível 2. Instale no seu ambiente com: pip install captum")
+
         data_scaled = self.scaler.transform(df_anomaly.values)
         windows = self._reshape_data(data_scaled)
         if len(windows) == 0: raise ValueError("Dados insuficientes para formar uma janela.")
             
-        loader = DataLoader(TensorDataset(torch.tensor(windows, dtype=torch.float32)), batch_size=batch_size, shuffle=False)
+        tensor_windows = torch.tensor(windows, dtype=torch.float32)
+        loader = DataLoader(TensorDataset(tensor_windows), batch_size=batch_size, shuffle=False)
         
-        total_error_val = torch.zeros(self.n_features).to(self.device)
+        # Função diferenciável para o Captum (Mapeia a entrada para o Anomaly Score Global)
+        def anomaly_score_func(inputs_tensor):
+            reconstructions = self.model(inputs_tensor)
+            # Soma de todo o erro (MSE). O MSE dá um gradiente proporcional ao erro, ideal para XAI.
+            return torch.sum(torch.pow(reconstructions - inputs_tensor, 2))
+
+        ig = IntegratedGradients(anomaly_score_func)
+        
+        total_attributions = torch.zeros(self.n_features).to(self.device)
         reconstructed_vals_last_step = []
         
         self.model.eval()
-        with torch.no_grad():
-            for (inputs,) in loader:
-                inputs = inputs.to(self.device)
+        for (inputs,) in loader:
+            inputs = inputs.to(self.device)
+            
+            # Reconstrução pura para o dataframe final
+            with torch.no_grad():
                 recon = self.model(inputs)
-                
-                batch_error = torch.pow(inputs - recon, 2)
-                total_error_val += torch.sum(batch_error, dim=[0, 1])
                 reconstructed_vals_last_step.extend(recon[:, -1, :].cpu().numpy())
+            
+            # 1. Integrated Gradients para Atribuição de Causa Raiz
+            # Usamos tensores zerados (valor médio normalizado) como baseline
+            baseline = torch.zeros_like(inputs).to(self.device)
+            
+            # Calcula o gradiente integrado (retorna tensor [batch, seq_len, features])
+            attributions = ig.attribute(inputs, baselines=baseline, n_steps=20)
+            
+            # Pegamos o valor absoluto do gradiente
+            attr_abs = torch.abs(attributions)
+            
+            # Acumula as contribuições por feature
+            total_attributions += torch.sum(attr_abs, dim=[0, 1])
 
-        # 1. Pipeline de Causa Raiz (MAD)
-        variable_scores = total_error_val.cpu().numpy()
+        # Pipeline de Análise das Atribuições e Filtro MAD
+        variable_scores = total_attributions.cpu().numpy()
         total_period_error = np.sum(variable_scores)
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
@@ -438,8 +468,11 @@ class CNN_AE:
             
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
+        # Usando MAD robusto
         median_score = df_contrib['score'].median()
         mad = (df_contrib['score'] - median_score).abs().median()
+        if mad == 0: mad = 1e-6 # fallback caso as variaveis normais tenham gradiente 0
+        
         mad_threshold = median_score + (1.4826 * mad)
         
         df_contrib_filtered = df_contrib[df_contrib['score'] > mad_threshold].copy()
@@ -452,7 +485,7 @@ class CNN_AE:
         
         contributions_dict = df_contrib_filtered[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%']].to_dict()
 
-        # 2. Pipeline de Reconstrução Desnormalizada
+        # 2. Pipeline de Reconstrução Desnormalizada para output visual
         recon_arr = np.array(reconstructed_vals_last_step)
         recon_real = self.scaler.inverse_transform(recon_arr)
         

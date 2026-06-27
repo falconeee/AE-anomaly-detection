@@ -52,7 +52,6 @@ class ConvLSTMCell(nn.Module):
                               kernel_size=self.kernel_size,
                               padding=self.padding,
                               bias=self.bias)
-        self.norm = nn.GroupNorm(4, 4 * self.hidden_dim)
 
     def forward(self, input_tensor, cur_state):
         h_cur, c_cur = cur_state
@@ -60,7 +59,6 @@ class ConvLSTMCell(nn.Module):
         # Concatenate input and previous hidden state along the channel dimension (dim=1)
         combined = torch.cat([input_tensor, h_cur], dim=1)
         combined_conv = self.conv(combined)
-        combined_conv = self.norm(combined_conv)
         
         # Split into the 4 LSTM gates (Input, Forget, Output, Cell Candidate)
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
@@ -103,9 +101,8 @@ class TemporalAttention(nn.Module):
             # Sum over Channels, Height, and Width to get a single scalar score per batch element
             dot_product = torch.sum(curr_step * last_step, dim=(1, 2, 3)) 
             
-            # Scaled Dot-Product: divide by sqrt(d_k) to prevent exploding logits before softmax
-            dim_size = hidden_states.shape[2] * hidden_states.shape[3] * hidden_states.shape[4]
-            weights.append(dot_product / math.sqrt(dim_size))
+            # Division by 'steps' acts as a scaling factor to prevent exploding logits before softmax
+            weights.append(dot_product / steps)
         
         # Stack temporal weights to shape [batch, steps]
         weights = torch.stack(weights, dim=1)
@@ -218,63 +215,19 @@ class MSCRED_hybrid(nn.Module):
 
 class HybridDataset(Dataset):
     """
-    Feeds multi-scale signature matrices alongside target regression values (Y) on-the-fly.
-    This prevents OOM (Out-of-Memory) errors by not pre-computing gigabytes of matrices.
+    Feeds standard input matrices (X) alongside target regression values (Y).
     """
-    def __init__(self, data_list, scaler_params, win_size, step_max, gap_time):
-        self.win_size = win_size
-        self.step_max = step_max
-        self.gap_time = gap_time
-        
-        self.valid_indices = [] # Stores (block_idx, timestamp_idx)
-        self.data_blocks = []
-        
-        min_val, max_val = scaler_params
-        
-        for b_idx, df in enumerate(data_list):
-            data_values = df.values
-            # Normalize block on initialization
-            data_norm = (data_values - min_val.T) / (max_val.T - min_val.T + 1e-6)
-            self.data_blocks.append(data_norm)
-            
-            total_time = len(data_norm)
-            # Find valid targets based on sliding window constraints
-            start_index = (win_size[-1] // gap_time) + step_max
-            for t in range(start_index * gap_time, total_time, gap_time):
-                self.valid_indices.append((b_idx, t))
+    def __init__(self, matrix_array, value_array):
+        self.matrices = matrix_array
+        self.values = value_array
 
     def __len__(self):
-        return len(self.valid_indices)
+        return self.matrices.shape[0]
 
     def __getitem__(self, idx):
-        b_idx, t = self.valid_indices[idx]
-        data_block = self.data_blocks[b_idx]
-        
-        sensor_n = data_block.shape[1]
-        sequence_matrices = []
-        
-        # Target raw values (Hybrid magnitude)
-        y_target = data_block[t]
-        
-        # We need the last 'step_max' steps backwards
-        for step in range(self.step_max, 0, -1):
-            t_idx = t - (step * self.gap_time)
-            
-            multi_scale_step = []
-            for win in self.win_size:
-                if t_idx >= win:
-                    segment = data_block[t_idx - win : t_idx].T
-                    matrix_t = np.matmul(segment, segment.T) / win
-                else:
-                    matrix_t = np.zeros((sensor_n, sensor_n))
-                multi_scale_step.append(matrix_t)
-                
-            sequence_matrices.append(multi_scale_step)
-            
-        x_tensor = torch.from_numpy(np.array(sequence_matrices)).float()
-        y_tensor = torch.from_numpy(y_target).float()
-        
-        return x_tensor, y_tensor
+        # Conversion to float32 ensures precision compatibility with PyTorch weights
+        return (torch.from_numpy(self.matrices[idx]).float(), 
+                torch.from_numpy(self.values[idx]).float())
 
 class SPOT:
     """
@@ -456,7 +409,6 @@ class SPOT:
         else: 
             return self.init_threshold - sigma * math.log(r)
 
-
 class MSCRED:
     """
     Main orchestration class for the Hybrid MSCRED pipeline.
@@ -497,6 +449,100 @@ class MSCRED:
         min_val = np.min(data, axis=1, keepdims=True)
         return min_val, max_val
 
+    def _generate_signature_matrix(self, df_block):
+        """
+        Core data transformation pipeline.
+        Converts flat multivariate time-series into 5D spatial-temporal tensors:
+        (Samples, Time_Steps, Scales, Sensors, Sensors)
+        """
+        step_max = self.model_config['step_max']
+        gap_time = self.model_config['gap_time']
+        win_size = self.model_config['win_size']
+        
+        data = np.array(df_block.values.T, dtype=np.float64)
+        sensor_n = data.shape[0]
+        total_time = data.shape[1]
+        
+        # 1. Normalization
+        min_val, max_val = self.scaler_params
+        epsilon = 1e-6
+        data = (data - min_val) / (max_val - min_val + epsilon)
+
+        # 2. Multi-scale Matrix Generation (Inner Products)
+        # Calculates the spatial correlation between all sensor pairs within each window
+        data_all_scales = []
+        for w in range(len(win_size)):
+            matrix_list = []
+            win = win_size[w]
+            
+            for t in range(0, total_time, gap_time):
+                matrix_t = np.zeros((sensor_n, sensor_n))
+                if t >= win:
+                    segment = data[:, t - win : t]
+                    # Matrix Multiplication: (N x W) * (W x N) = (N x N)
+                    matrix_t = np.matmul(segment, segment.T) / win
+                matrix_list.append(matrix_t)
+            data_all_scales.append(matrix_list)
+
+        # 3. Temporal Sequence Assembly for ConvLSTM
+        X_block = []
+        total_generated_steps = len(data_all_scales[0])
+        num_scales = len(win_size)
+        
+        # Ensures we only start creating sequences when enough historical matrices exist
+        start_idx = (win_size[-1] // gap_time) + step_max
+
+        for i in range(total_generated_steps):
+            if i < start_idx:
+                continue
+            
+            sequence_matrices = [] 
+            # Collects the last 'step_max' matrices to form the temporal sequence
+            for step in range(step_max, 0, -1):
+                idx = i - step
+                multi_scale_step = []
+                # Stacks the different scales (Channels) for this specific time step
+                for scale_idx in range(num_scales):
+                    multi_scale_step.append(data_all_scales[scale_idx][idx])
+                sequence_matrices.append(multi_scale_step)
+            
+            X_block.append(np.array(sequence_matrices))
+
+        if len(X_block) > 0:
+            return np.array(X_block)
+        else:
+            return np.empty((0))
+
+    def _prepare_hybrid_data(self, X_matrices, df_source):
+        """
+        Aligns raw target values with the generated correlation matrices.
+        Essential for the Hybrid architecture (Regression Head).
+        """
+        gap_time = self.model_config['gap_time']
+        win_size = self.model_config['win_size']
+        step_max = self.model_config['step_max']
+        
+        # Calculates the exact index drop offset caused by the sliding window buffer
+        start_gap_steps = (win_size[-1] // gap_time) + step_max
+        start_index_real = start_gap_steps * gap_time
+        
+        min_val, max_val = self.scaler_params
+        data_values = df_source.values
+        
+        # Applies global MinMax scaling identically to the matrices
+        data_norm = (data_values - min_val.T) / (max_val.T - min_val.T + 1e-6)
+        
+        # Temporal slicing to perfectly match row 0 of Y with row 0 of X
+        values_aligned = data_norm[start_index_real :: gap_time]
+        
+        # Safety cutoff to prevent length mismatch errors 
+        min_len = min(len(X_matrices), len(values_aligned))
+        
+        X_final = X_matrices[:min_len]
+        y_final = values_aligned[:min_len]
+        
+        return X_final, y_final
+
     def fit(self, df_train_list, gain=1, epochs=None):
         # Support for both single DataFrame or lists (useful for disjoint periods)
         if not isinstance(df_train_list, list):
@@ -509,19 +555,34 @@ class MSCRED:
         # Scaler
         self.scaler_params = self._get_scaler(df_train_list)
         
-        # Initialize On-the-fly Dataset
-        dataset = HybridDataset(df_train_list, self.scaler_params, self.model_config['win_size'], self.model_config['step_max'], self.model_config['gap_time'])
+        # Generate Matrices
+        X_train_list = []
+        for i, block in enumerate(df_train_list):
+            X_proc = self._generate_signature_matrix(block)
+            if X_proc.size > 0:
+                X_train_list.append(X_proc)
         
-        if len(dataset) == 0:
+        if not X_train_list:
             raise ValueError("No training data generated.")
             
-        self.sensor_n = df_train_list[0].shape[1]
-        scale_n = len(self.model_config['win_size'])
+        X_train_final = np.concatenate(X_train_list, axis=0)
+        
+        # Prepare Hybrid Data (Aligns X matrices with Y raw values)
+        df_train_full = pd.concat(df_train_list)
+        X_train_hybrid, y_train_hybrid = self._prepare_hybrid_data(X_train_final, df_train_full)
+        
+        # Initialize Model dynamically based on generated data shapes
+        sample_shape = X_train_hybrid.shape
+        scale_n = sample_shape[2]
+        self.sensor_n = sample_shape[3]
         
         self.model = MSCRED_hybrid(sensor_n=self.sensor_n, scale_n=scale_n, step_max=self.model_config['step_max']).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.model_config['learning_rate'])
         criterion = nn.MSELoss()
         
+        # Training DataLoader
+        dataset = HybridDataset(X_train_hybrid, y_train_hybrid)
+        # shuffle=True is critical here to break temporal sequence bias during batch training
         dataloader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=True) 
         
         self.model.train()
@@ -534,6 +595,7 @@ class MSCRED:
                 batch_matrix = batch_matrix.to(self.device)
                 batch_values = batch_values.to(self.device)
                 
+                # Ground truth for matrix is the last temporal step in the sequence
                 target_matrix = batch_matrix[:, -1, :, :, :]
                 
                 optimizer.zero_grad()
@@ -542,10 +604,13 @@ class MSCRED:
                 loss_matrix = criterion(recon_matrix, target_matrix)
                 loss_value = criterion(recon_values, batch_values)
 
+                # Dimensionality Balancing: Scales the mean errors by the number of elements
+                # Ensures the Value Loss (N elements) isn't overpowered by the Matrix Loss (N*N elements)
                 n_elements = self.sensor_n * self.sensor_n
                 loss_matrix_scaled = loss_matrix * n_elements
                 loss_value_scaled = loss_value * n_elements
 
+                # Alpha controls the weight of the hybrid value regression
                 alpha = 1.0 
                 total_loss = loss_matrix_scaled + (alpha * loss_value_scaled)
 
@@ -558,24 +623,38 @@ class MSCRED:
 
         # Calculate Threshold (POT Calibration)
         self.model.eval()
-        train_scores = self._get_train_scores(dataset)
+        train_scores = self._get_train_scores(X_train_hybrid, y_train_hybrid)
         self.threshold = self._pot_eval(train_scores) * self.gain
         print(f"Threshold: {self.threshold}")
         
-    def _get_train_scores(self, dataset):
-        loader = DataLoader(dataset, batch_size=32, shuffle=False)
+    def _get_train_scores(self, X_train, y_train):
+        # NOTE: Using np.float32 instead of float64 here saves 50% RAM and is sufficient for PyTorch
+        dataset = HybridDataset(X_train.astype(np.float32), y_train.astype(np.float32))
+        loader = DataLoader(dataset, batch_size=32, shuffle=False) # shuffle=False to maintain temporal order
+        
         all_scores = []
         with torch.no_grad():
             for batch_x, _ in loader:
+                # We only need the matrix error to establish the anomaly threshold
                 recon_matrix, _ = self.model(batch_x.to(self.device))
+                
+                # Grabs the last step directly from the CPU batch to avoid unnecessary GPU-to-CPU transfer
                 gt_batch = batch_x.numpy()[:, -1, :, :, :]
                 recon_np = recon_matrix.cpu().numpy()
+                
+                # Calculate MSE across spatial dimensions (Scales, H, W)
                 diff = np.square(gt_batch - recon_np)
                 scores = np.mean(diff, axis=(1, 2, 3))
                 all_scores.append(scores)
+                
         return np.concatenate(all_scores, axis=0)
 
     def _pot_eval(self, init_score, q=1e-4, level=0.02):
+        """
+        Calculates the Extreme Value Theory threshold.
+        Includes a fallback mechanism that smoothly lowers the peak threshold 
+        if the SciPy optimization fails to converge.
+        """
         lms = level
         while True:
             try:
@@ -584,6 +663,7 @@ class MSCRED:
                 s.initialize(level=lms, min_extrema=False, verbose=False)
                 return s.extreme_quantile
             except Exception:
+                # Graceful degradation of the peak parameter
                 lms = lms * 0.999
 
     def predict(self, df_test, timestamps=None):
@@ -593,30 +673,57 @@ class MSCRED:
         if timestamps is None:
             timestamps = df_test.index
             
-        dataset = HybridDataset([df_test], self.scaler_params, self.model_config['win_size'], self.model_config['step_max'], self.model_config['gap_time'])
-        loader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=False)
+        X_test = self._generate_signature_matrix(df_test)
+        
+        # Calculate the temporal offset caused by the sliding window buffer
+        gap_time = self.model_config['gap_time']
+        win_size = self.model_config['win_size']
+        step_max = self.model_config['step_max']
+        start_gap_steps = (win_size[-1] // gap_time) + step_max
+        start_index_real = start_gap_steps * gap_time
         
         # Align timestamps to match the valid predictions generated
-        valid_timestamps = [timestamps[t] for b, t in dataset.valid_indices]
+        if hasattr(timestamps, 'values'):
+            ts_values = timestamps.values
+        else:
+            ts_values = np.array(timestamps)
+        
+        valid_timestamps = ts_values[start_index_real :: gap_time]
+        
+        # Retrieve both matrices and raw values for hybrid inference
+        X_test_final, _ = self._prepare_hybrid_data(X_test, df_test)
+        
+        # Dummy targets used since we only need the input for prediction
+        dataset = HybridDataset(X_test_final.astype(np.float64), np.zeros((len(X_test_final), self.sensor_n)))
+        loader = DataLoader(dataset, batch_size=self.model_config['batch_size'], shuffle=False)
         
         self.model.eval()
+
         matrix_scores = []
         value_scores = []
 
         with torch.no_grad():
+            # Loader unpacks both X (matrices) and Y (dummy targets, ignored here)
             for batch_x, batch_y in loader:
                 batch_x = batch_x.to(self.device)
                 batch_y_np = batch_y.numpy()
                 
                 recon_matrix, recon_vals = self.model(batch_x)
                 
+                # 1. Matrix Score (Topology/Correlation Error)
+                # Compares the reconstructed matrix with the last step of the input sequence
                 gt_matrix = batch_x.cpu().numpy()[:, -1, :, :, :]
                 recon_matrix_np = recon_matrix.cpu().numpy()
                 diff_matrix = np.square(gt_matrix - recon_matrix_np)
+                
+                # Averages over spatial dimensions (Scales, Height, Width) -> Shape: (Batch,)
                 scores_m = np.mean(diff_matrix, axis=(1, 2, 3)) 
                 
+                # 2. Value Score (Hybrid Magnitude Error)
                 recon_vals_np = recon_vals.cpu().numpy()
                 diff_vals = np.square(batch_y_np - recon_vals_np)
+                
+                # Averages over sensors -> Shape: (Batch,)
                 scores_v = np.mean(diff_vals, axis=1) 
                 
                 matrix_scores.append(scores_m)
@@ -625,9 +732,12 @@ class MSCRED:
         final_matrix_scores = np.concatenate(matrix_scores, axis=0)
         final_value_scores = np.concatenate(value_scores, axis=0)
 
+        # Dimensional Balance: Since both scores are means, they are on the same scale.
+        # Alpha controls the weight of the raw value anomaly relative to the correlation anomaly.
         alpha = 1.0
         final_scores = final_matrix_scores + (alpha * final_value_scores)
         
+        # Safe length alignment to prevent index out of bounds
         min_len = min(len(final_scores), len(valid_timestamps))
         
         return {
@@ -635,46 +745,28 @@ class MSCRED:
             'phi': final_scores[:min_len]
         }
 
-    def contribution(self, df_test, df_sistema, anomaly_timestamps, batch_size=32, alpha=1.0):
+    def contribution(self, df_test, df_sistema, timestamps=None, batch_size=32, alpha=1.0):
         """
         Root Cause Analysis (RCA) for Hybrid MSCRED.
-        Calculates contributions only for the specific anomalous timestamps.
+        Combines spatial correlation errors (matrices) and magnitude errors (values).
+        Uses MAD (Median Absolute Deviation) to dynamically filter root cause variables.
         """
         if self.model is None:
             raise ValueError("Model not trained.")
             
-        if anomaly_timestamps is None or len(anomaly_timestamps) == 0:
-            raise ValueError("anomaly_timestamps is required for robust RCA.")
-            
         self.model.eval()
         
-        # Find positional indices for the anomalies
-        if hasattr(df_test.index, 'isin'):
-            mask = df_test.index.isin(anomaly_timestamps)
-            anomaly_indices = np.where(mask)[0]
-        else:
-            anomaly_indices = []
-            test_ts = np.array(df_test.index)
-            for at in anomaly_timestamps:
-                idx = np.where(test_ts == at)[0]
-                if len(idx) > 0:
-                    anomaly_indices.append(idx[0])
-                    
-        dataset = HybridDataset([df_test], self.scaler_params, self.model_config['win_size'], self.model_config['step_max'], self.model_config['gap_time'])
+        X_test = self._generate_signature_matrix(df_test)
         
-        # Filter to evaluate ONLY the anomalous indices
-        filtered_indices = []
-        for b, t in dataset.valid_indices:
-            if t in anomaly_indices:
-                filtered_indices.append((b, t))
-                
-        dataset.valid_indices = filtered_indices
-        
-        if len(dataset) == 0:
-            raise ValueError("No valid sequences generated for the provided anomaly_timestamps.")
+        if len(X_test) == 0:
+            raise ValueError("No matrices generated from input dataframe!")
             
+        X_test_final, y_test_final = self._prepare_hybrid_data(X_test, df_test)
+        
+        dataset = HybridDataset(X_test_final.astype(np.float32), y_test_final.astype(np.float32))
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         
+        # Accumulators for total absolute errors
         total_error_matrix = np.zeros((self.sensor_n, self.sensor_n), dtype=np.float64)
         total_error_val = np.zeros(self.sensor_n, dtype=np.float64)
         
@@ -687,46 +779,47 @@ class MSCRED:
                 
                 recon_matrix, recon_vals = self.model(batch_x)
                 
+                # --- Matrix Error (Broken Correlations) ---
                 recon_matrix_np = recon_matrix.cpu().numpy()
                 gt_batch_mat = batch_x.cpu().numpy()[:, -1, :, :, :]
                 
                 diff_mat = np.square(gt_batch_mat - recon_matrix_np)
                 diff_aggregated_scales = np.mean(diff_mat, axis=1) 
                 
+                # Sums error over the batch to accumulate the total period contribution
                 total_error_matrix += np.sum(diff_aggregated_scales, axis=0) 
                 
+                # --- Value Error (Direct Hybrid Magnitude) ---
                 recon_vals_np = recon_vals.cpu().numpy()
                 diff_val = np.square(batch_y_np - recon_vals_np)
                 total_error_val += np.sum(diff_val, axis=0) 
                 
+                # Stores values for later physical denormalization
                 reconstructed_values_list.extend(recon_vals_np)
 
-        # Robust Cross-Sensor Normalization
+        # Score Processing & Dimensional Balance
+        # Summing dim=1 calculates how much sensor 'i' broke correlations with ALL other sensors
         mat_scores = np.sum(total_error_matrix, axis=1)
         val_scores = total_error_val
         
-        def robust_normalize(scores):
-            min_s = np.min(scores)
-            max_s = np.max(scores)
-            if max_s - min_s == 0: return np.zeros_like(scores)
-            return (scores - min_s) / (max_s - min_s)
-
-        mat_scores_norm = robust_normalize(mat_scores)
-        val_scores_norm = robust_normalize(val_scores)
-        
-        variable_scores = mat_scores_norm + (alpha * val_scores_norm)
+        # The matrix row has N elements, the value vector has 1.
+        # Multiplying by N scales the value error so it has equal voting weight.
+        val_scores_scaled = val_scores * self.sensor_n
+        variable_scores = mat_scores + (alpha * val_scores_scaled)
         
         variable_names = df_test.columns
         total_period_error = np.sum(variable_scores)
         
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
+        # Construct raw Contribution DataFrame
         df_contrib = pd.DataFrame({
             'VARIAVEL': variable_names,
             'score': variable_scores,
             '%': contrib_pct
         })
         
+        # Merge physical descriptions and system data safely
         cols_to_merge = ['VARIAVEL', 'DESC']
         if 'SISTEMA' in df_sistema.columns:
             cols_to_merge.append('SISTEMA')
@@ -738,25 +831,31 @@ class MSCRED:
         
         df_contrib = df_contrib.sort_values(by='score', ascending=False).reset_index(drop=True)
 
-        # Dynamic Outlier Identification (MAD Approach)
+        # --- Dynamic Outlier Identification (MAD Approach) ---
+        # Robust against "Masking Effect" caused by extreme, systemic anomalies.
         df_contrib_backup = df_contrib.copy()
         
         median_score = df_contrib['score'].median()
         mad = (df_contrib['score'] - median_score).abs().median()
         
+        # k=1.4826 scales the MAD to approximate standard deviation behavior
         k = 1.4826
         mad_threshold = median_score + (k * mad)
         
+        # Isolate sensors acting as mathematical outliers (Root Causes)
         df_contrib = df_contrib[df_contrib['score'] > mad_threshold].copy()
         
+        # Fallback: Enforce top 3 culprits if anomaly signature is too subtle
         if len(df_contrib) == 0:
             df_contrib = df_contrib_backup.head(3).copy()
 
+        # Recalculate relative culpability strictly within the isolated culprit group
         if df_contrib['score'].sum() > 0:
             df_contrib['%'] = (df_contrib['score'] / df_contrib['score'].sum()) * 100
         else:
             df_contrib['%'] = 0.0
 
+        # Output Formatting
         df_contrib.index = df_contrib.index.astype(str)
         
         final_cols = ['VARIAVEL', 'DESC', 'score', '%']
@@ -765,19 +864,37 @@ class MSCRED:
         df_contrib = df_contrib[final_cols]
         contributions_dict = df_contrib.to_dict(orient='dict')
 
-        # Denormalization for Dashboards
+        # --- Denormalization for Physical Dashboards ---
         min_val, max_val = self.scaler_params
         recon_arr = np.array(reconstructed_values_list)
+        
+        # Inverse MinMax Transform: Val = Norm * (Max - Min) + Min
         recon_real = recon_arr * (max_val.T - min_val.T) + min_val.T
         
-        valid_timestamps = [df_test.index[t] for b, t in dataset.valid_indices]
-        
-        min_len = min(len(recon_real), len(valid_timestamps))
-        recon_real = recon_real[:min_len]
-        valid_timestamps = valid_timestamps[:min_len]
-        
-        df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns, index=valid_timestamps)
-        df_reconstruction.index.name = 'timestamp'
-        df_reconstruction.reset_index(inplace=True)
+        # Temporal Alignment for Reconstruction View
+        if timestamps is not None:
+            gap_time = self.model_config['gap_time']
+            win_size = self.model_config['win_size']
+            step_max = self.model_config['step_max']
+            
+            start_gap_steps = (win_size[-1] // gap_time) + step_max
+            start_index_real = start_gap_steps * gap_time
+            
+            if hasattr(timestamps, 'values'):
+                ts_values = timestamps.values
+            else:
+                ts_values = np.array(timestamps)
+                
+            valid_timestamps = ts_values[start_index_real :: gap_time]
+            
+            min_len = min(len(recon_real), len(valid_timestamps))
+            recon_real = recon_real[:min_len]
+            valid_timestamps = valid_timestamps[:min_len]
+            
+            df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns, index=valid_timestamps)
+            df_reconstruction.index.name = 'timestamp'
+            df_reconstruction.reset_index(inplace=True)
+        else:
+            df_reconstruction = pd.DataFrame(recon_real, columns=df_test.columns)
             
         return contributions_dict, df_reconstruction
