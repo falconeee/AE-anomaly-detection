@@ -110,49 +110,38 @@ class SPOT:
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_size, latent_size, seq_len, n_features):
+    def __init__(self, in_size, latent_size):
         super().__init__()
-        self.seq_len = seq_len
-        self.n_features = n_features
-        # Conv1d expects (Batch, Channels, Length) -> (Batch, n_features, seq_len)
-        self.conv1 = nn.Conv1d(n_features, n_features * 2, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(n_features * 2, n_features * 4, kernel_size=3, padding=1)
-        self.flatten_size = (n_features * 4) * seq_len
-        self.linear = nn.Linear(self.flatten_size, latent_size)
+        self.linear1 = nn.Linear(in_size, int(in_size/2))
+        self.linear2 = nn.Linear(int(in_size/2), int(in_size/4))
+        self.linear3 = nn.Linear(int(in_size/4), latent_size)
         self.relu = nn.ReLU(True)
         
     def forward(self, w):
-        x = w.view(-1, self.seq_len, self.n_features).transpose(1, 2)
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = x.flatten(1)
-        return self.relu(self.linear(x))
+        out = self.relu(self.linear1(w))
+        out = self.relu(self.linear2(out))
+        return self.relu(self.linear3(out))
     
 class Decoder(nn.Module):
-    def __init__(self, latent_size, out_size, seq_len, n_features):
+    def __init__(self, latent_size, out_size):
         super().__init__()
-        self.seq_len = seq_len
-        self.n_features = n_features
-        self.flatten_size = (n_features * 4) * seq_len
-        self.linear = nn.Linear(latent_size, self.flatten_size)
-        self.conv1 = nn.Conv1d(n_features * 4, n_features * 2, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(n_features * 2, n_features, kernel_size=3, padding=1)
+        self.linear1 = nn.Linear(latent_size, int(out_size/4))
+        self.linear2 = nn.Linear(int(out_size/4), int(out_size/2))
+        self.linear3 = nn.Linear(int(out_size/2), out_size)
         self.relu = nn.ReLU(True)
         self.sigmoid = nn.Sigmoid()
         
     def forward(self, z):
-        x = self.relu(self.linear(z))
-        x = x.view(-1, self.n_features * 4, self.seq_len)
-        x = self.relu(self.conv1(x))
-        x = self.sigmoid(self.conv2(x))
-        return x.transpose(1, 2).reshape(-1, self.seq_len * self.n_features)
+        out = self.relu(self.linear1(z))
+        out = self.relu(self.linear2(out))
+        return self.sigmoid(self.linear3(out))
     
 class UsadCore(nn.Module):
-    def __init__(self, w_size, z_size, seq_len, n_features):
+    def __init__(self, w_size, z_size):
         super().__init__()
-        self.encoder = Encoder(w_size, z_size, seq_len, n_features)
-        self.decoder1 = Decoder(z_size, w_size, seq_len, n_features)
-        self.decoder2 = Decoder(z_size, w_size, seq_len, n_features)
+        self.encoder = Encoder(w_size, z_size)
+        self.decoder1 = Decoder(z_size, w_size)
+        self.decoder2 = Decoder(z_size, w_size)
   
     def training_step(self, batch, n):
         z = self.encoder(batch)
@@ -193,11 +182,10 @@ class USAD:
         torch.backends.cudnn.benchmark = False
 
     def _reshape_data(self, data):
-        if len(data) < self.seq_len:
-            return np.array([])
-        windowed = np.lib.stride_tricks.sliding_window_view(data, window_shape=self.seq_len, axis=0)
-        windowed = np.swapaxes(windowed, 1, 2)
-        return windowed[::self.stride]
+        xs = []
+        for i in range(0, len(data) - self.seq_len + 1, self.stride):
+            xs.append(data[i:(i + self.seq_len)])
+        return np.array(xs)
 
     def fit(self, train_data, epochs=70, batch_size=128, lr=1e-4, gain=1.0, verbose=True):
         """
@@ -246,7 +234,7 @@ class USAD:
         
         # Initialize Model
         w_size = self.seq_len * self.n_features
-        self.model = UsadCore(w_size, self.z_size, self.seq_len, self.n_features).to(self.device)
+        self.model = UsadCore(w_size, self.z_size).to(self.device)
         
         # Two separate optimizers for the Adversarial Training (AE1 and AE2)
         opt1 = torch.optim.Adam(list(self.model.encoder.parameters()) + list(self.model.decoder1.parameters()), lr=lr)
@@ -303,32 +291,6 @@ class USAD:
         # Gain acts as a manual sensitivity multiplier 
         # (e.g., gain=1.2 makes alarms 20% less sensitive/higher threshold)
         self.threshold = self.threshold * self.gain
-
-        # RCA Baseline Calibration (Z-Score)
-        if verbose: print("Calibrating RCA baselines...")
-        self.model.eval()
-        train_recon_errors = []
-        with torch.no_grad():
-            for (batch,) in train_loader:
-                inputs = batch.to(self.device).view(batch.size(0), -1)
-                z = self.model.encoder(inputs)
-                w1 = self.model.decoder1(z)
-                w2 = self.model.decoder2(self.model.encoder(w1))
-                
-                inputs_3d = inputs.view(batch.size(0), self.seq_len, self.n_features)
-                w1_3d = w1.view(batch.size(0), self.seq_len, self.n_features)
-                w2_3d = w2.view(batch.size(0), self.seq_len, self.n_features)
-                
-                diff1 = torch.pow(inputs_3d - w1_3d, 2)
-                diff2 = torch.pow(inputs_3d - w2_3d, 2)
-                weighted_error = (self.alpha * diff1) + (self.beta * diff2)
-                
-                window_error = torch.mean(weighted_error, dim=1)
-                train_recon_errors.append(window_error.cpu().numpy())
-                
-        train_recon_errors = np.concatenate(train_recon_errors, axis=0)
-        self.rca_mu = np.mean(train_recon_errors, axis=0)
-        self.rca_sigma = np.std(train_recon_errors, axis=0) + 1e-9
 
     def _get_anomaly_scores(self, tensor_data, batch_size=128):
         self.model.eval()
@@ -449,14 +411,8 @@ class USAD:
         loader = DataLoader(TensorDataset(tensor_test), batch_size=batch_size, shuffle=False)
         
         # Acumuladores de Erro e Reconstrução
-        temporal_scores = []
         total_error_per_feature = torch.zeros(self.n_features).to(self.device)
         reconstructed_vals = []
-        
-        has_rca_stats = hasattr(self, 'rca_mu') and self.rca_mu is not None
-        if has_rca_stats:
-            mu_t = torch.tensor(self.rca_mu, dtype=torch.float32, device=self.device)
-            sig_t = torch.tensor(self.rca_sigma, dtype=torch.float32, device=self.device)
         
         with torch.no_grad():
             for (batch,) in loader:
@@ -480,23 +436,15 @@ class USAD:
                 diff2 = torch.pow(inputs_3d - w2_3d, 2)
                 weighted_error = (self.alpha * diff1) + (self.beta * diff2)
                 
-                # Média da janela inteira para alinhar com a detecção
-                window_error = torch.mean(weighted_error, dim=1)
-                
-                # Z-Score do Erro (se calibrado no fit)
-                if has_rca_stats:
-                    window_error = (window_error - mu_t) / sig_t
-                    window_error = torch.relu(window_error) # Ignorar erros menores que a média normal
-                
-                total_error_per_feature += torch.sum(window_error, dim=0)
-                temporal_scores.extend(window_error.cpu().numpy())
+                # Isolar apenas o ÚLTIMO ponto da janela (instante atual t)
+                last_point_error = weighted_error[:, -1, :]
+                total_error_per_feature += torch.sum(last_point_error, dim=0)
                 
                 # Guardar os valores reconstruídos pelo AE1 (Decodificador 1) para o df_projection
                 last_point_recon = w1_3d[:, -1, :]
                 reconstructed_vals.extend(last_point_recon.cpu().numpy())
 
         # Score Processing
-        temporal_scores = np.array(temporal_scores)
         variable_scores = total_error_per_feature.cpu().numpy()
         variable_names = df_test.columns
         total_period_error = np.sum(variable_scores)
@@ -509,8 +457,7 @@ class USAD:
         df_contrib = pd.DataFrame({
             'VARIAVEL': variable_names,
             'score': variable_scores,
-            '%': contrib_pct,
-            'score_history': list(temporal_scores.T)
+            '%': contrib_pct
         })
         
         df_contrib = pd.merge(df_contrib, df_sistema[['VARIAVEL', 'DESC', 'SISTEMA']], on='VARIAVEL', how='left')
@@ -541,7 +488,7 @@ class USAD:
             df_contrib['%'] = 0.0
 
         df_contrib.index = df_contrib.index.astype(str)
-        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%', 'score_history']]
+        df_contrib = df_contrib[['VARIAVEL', 'DESC', 'SISTEMA', 'score', '%']]
         
         contributions_dict = df_contrib.to_dict()
 

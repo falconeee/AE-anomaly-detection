@@ -168,11 +168,7 @@ class Encoder(nn.Module):
             inp = torch.cat([h_seq[:, t, :], z_prev], dim=1)
             mu = self.z_mean(inp)
             std = F.softplus(self.z_std(inp)) + 1e-4
-            
-            if self.training:
-                z_t = mu + std * torch.randn_like(mu)
-            else:
-                z_t = mu  # Deterministico durante inferencia (estabiliza RCA)
+            z_t = mu + std * torch.randn_like(mu)
             
             z_samples.append(z_t)
             mu_list.append(mu)
@@ -184,18 +180,17 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, x_dim, z_dim, hidden_dim, rnn_num_layers=1):
         super(Decoder, self).__init__()
-        # Substituido GRU por rede Densa (MLP) para decodificacao paralela no tempo
-        self.net = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim), nn.LeakyReLU(0.1),
+        self.gru = nn.GRU(z_dim, hidden_dim, rnn_num_layers, batch_first=True)
+        self.post_rnn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(0.1)
         )
         self.x_mean = nn.Linear(hidden_dim, x_dim)
         self.x_std = nn.Linear(hidden_dim, x_dim)
         
     def forward(self, z):
-        # z tem shape [batch, seq, z_dim]
-        # MLP aplica no ultimo eixo independentemente, processando a sequencia em paralelo
-        h_seq = self.net(z)
+        h_seq, _ = self.gru(z)
+        h_seq = self.post_rnn(h_seq)
         return self.x_mean(h_seq), F.softplus(self.x_std(h_seq)) + 1e-4
 
 class OmniAnomalyModel(nn.Module):
@@ -205,10 +200,6 @@ class OmniAnomalyModel(nn.Module):
         self.encoder = Encoder(x_dim, z_dim, hidden_dim)
         self.decoder = Decoder(x_dim, z_dim, hidden_dim)
         self.flow = FlowSequential(*[PlanarFlow(z_dim) for _ in range(nf_layers)]) if nf_layers > 0 else None
-        
-        # Transicao aprendida do Prior p(z_t | z_{t-1})
-        self.prior_mean = nn.Linear(z_dim, z_dim)
-        self.prior_std = nn.Sequential(nn.Linear(z_dim, z_dim), nn.Softplus())
             
     def forward(self, x):
         z_gen, z_mu, z_std = self.encoder(x)
@@ -235,11 +226,7 @@ class OmniAnomalyModel(nn.Module):
         
         z_t = output['z_fin']
         z_t_minus_1 = torch.cat([torch.zeros(z_t.size(0), 1, z_t.size(2)).to(z_t.device), z_t[:, :-1, :]], dim=1)
-        
-        prior_mu = self.prior_mean(z_t_minus_1)
-        prior_sigma = self.prior_std(z_t_minus_1) + 1e-4
-        prior_dist = torch.distributions.Normal(prior_mu, prior_sigma)
-        
+        prior_dist = torch.distributions.Normal(z_t_minus_1, torch.ones_like(z_t))
         log_p_z = prior_dist.log_prob(z_t).sum(dim=[-1, -2])
         
         elbo = log_p_x_given_z + log_p_z - log_q_z_fin
@@ -310,7 +297,7 @@ class OmniAnomaly:
                 lms *= 0.999
         return s.extreme_quantile
 
-    def fit(self, df_train, epochs=10, batch_size=128, lr=1e-3, gain=1.0, train_stride=None):
+    def fit(self, df_train, epochs=10, batch_size=128, lr=1e-3, gain=1.0):
         self.gain = gain
         
         # 1. Padroniza a entrada para ser sempre uma lista
@@ -331,11 +318,6 @@ class OmniAnomaly:
         
         # 4. Escala e gera janelas ISOLADAMENTE para cada dataframe da lista
         all_windows = []
-        
-        # Uso de stride maior para diminuir OOM e redundancia no treino (Default: seq_len // 2)
-        original_stride = self.stride
-        self.stride = train_stride if train_stride is not None else max(1, self.seq_len // 2)
-        
         for df in df_train:
             vals = df.values if isinstance(df, pd.DataFrame) else df
             data_scaled = self.scaler.transform(vals)
@@ -344,10 +326,8 @@ class OmniAnomaly:
             if len(windows) > 0:
                 all_windows.append(windows)
                 
-        self.stride = original_stride # Restaura o stride original
-                
         if not all_windows:
-            raise ValueError(f"Todos os dataframes fornecidos sao menores que o tamanho da janela (seq_len={self.seq_len}). Nenhuma janela foi gerada.")
+            raise ValueError(f"Todos os dataframes fornecidos são menores que o tamanho da janela (seq_len={self.seq_len}). Nenhuma janela foi gerada.")
             
         # Concatena todas as janelas geradas em um único array
         final_windows = np.concatenate(all_windows, axis=0)
@@ -484,19 +464,20 @@ class OmniAnomaly:
                 inputs = inputs.to(self.device)
                 output = self.model(inputs)
                 
-                # Reconstrucao
-                x_true = inputs[:, -1, :]
-                x_pred = output['x_rec_mu'][:, -1, :]
+                # Avalia Log Prob
+                dist = torch.distributions.Normal(output['x_rec_mu'], output['x_rec_std'])
+                log_prob = dist.log_prob(inputs) # [batch, seq, feature]
                 
-                # Opcao mais robusta para RCA: Erro Absoluto de reconstrucao
-                # Isso impede que variaveis com previsao de alta variancia (x_rec_std) mascarem as anomalias reais
-                batch_feature_scores = torch.abs(x_true - x_pred)
+                # Anomalia é falta de probabilidade (Neg Log Prob)
+                batch_feature_scores = -log_prob[:, -1, :] # Apenas o último ponto
                 total_feature_score += batch_feature_scores.sum(dim=0)
                 
-                reconstructed_vals_last_step.extend(x_pred.cpu().numpy())
+                reconstructed_vals_last_step.extend(output['x_rec_mu'][:, -1, :].cpu().numpy())
 
         # 1. Pipeline de Causa Raiz (MAD)
         variable_scores = total_feature_score.cpu().numpy()
+        # Remove negativos se houver devido a variância do flow (garantia de proporção)
+        variable_scores = np.clip(variable_scores, a_min=0, a_max=None) 
         total_period_error = np.sum(variable_scores)
         contrib_pct = (variable_scores / total_period_error * 100) if total_period_error > 0 else np.zeros_like(variable_scores)
 
