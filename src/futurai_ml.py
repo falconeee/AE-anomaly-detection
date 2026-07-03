@@ -219,78 +219,44 @@ class FuturaiML:
         também lista das varaiveis que mais influênciaram"""
 
         try:
-
             df = (df - self.media) / self.std
             linhas_colunas = df.shape
+            M = linhas_colunas[1]
 
-            seq_aux = list(range(len(df)))
+            df_np = df.values
+            if isinstance(phi, pd.DataFrame):
+                phi_np = phi.values
+            else:
+                phi_np = phi
 
-            n_fast_list = pd.DataFrame([seq_aux])
-            n_fast_list = n_fast_list.T
-            n_fast_list.columns = ["SEQ"]
-            rci = []
+            # Otimização: Vetorização completa da geração da matriz de contribuição e RCI
+            # Substitui o loop for e a inversão de matrizes custosas
+            df_phi = df_np @ phi_np
+            diag_phi = np.diag(phi_np)
 
-            # Geração da matriz de contribuição
-            for x in list(range(linhas_colunas[1])):
+            # Reconstrução das variáveis em falta (n_fast_list)
+            n_fast_list_np = df_np - (df_phi / diag_phi)
+            n_fast_list = pd.DataFrame(n_fast_list_np, columns=df.columns)
 
-                # Definindo epsilon - só entram as variáveis em falta
-                eps = np.eye(linhas_colunas[1])
-                eps = eps[:, x]
-                eps = pd.DataFrame(eps)
+            # RCI contém o score de importância de cada variável (calculado de forma vetorizada)
+            rci = np.sum(df_phi**2, axis=0) / diag_phi
 
-                # Definindo Trci - diagonal matrix which the elements are one for the faulty variables
-                k = [0] * linhas_colunas[1]
-                k[x] = 1
-                trci = np.diag(k)
-
-                # equação 13 - reconstrução das variáveis em falta
-                termo_1 = -np.linalg.inv(eps.T.dot(phi).dot(eps))
-                termo_2 = eps.T
-                termo_3 = phi
-                termo_4 = pd.DataFrame(np.eye(linhas_colunas[1]) - trci)
-                termo_5 = df.T
-
-                n_fast = termo_1.dot(termo_2).dot(termo_3).dot(termo_4).dot(termo_5)
-                n_fast = n_fast.T
-                n_fast = pd.DataFrame(n_fast)
-
-                # Equação 14 do RCI
-                termo_3 = (pd.DataFrame(df.iloc[:, x]).values) - n_fast.values
-                termo_1 = termo_3.T
-                termo_2 = eps.T.dot(phi).dot(eps)
-                termo_2 = float(termo_2.values)
-
-                # RCI contem o score de importancia de cada variavel no momento da falha
-                rci.append(float((termo_1 * termo_2).dot(termo_3)))
-
-                n_fast = pd.DataFrame(n_fast)
-                n_fast_list = pd.concat([n_fast_list, n_fast], axis=1)
-
-            n_fast_list = n_fast_list.drop(["SEQ"], axis=1)
-            n_fast_list.columns = df.columns
-
-            termo_1 = df - n_fast_list
-            termo_2 = eps.T.dot(phi).dot(eps)
-            termo_3 = termo_2 ** 0.5
-
-            circi = termo_1 * float(termo_3.values)
-            circi = circi ** 2
+            # Component RCI (circi) - Correção de bug do código original onde utilizava 
+            # o escalar eps da última iteração para todas as colunas
+            circi_np = (df_phi**2) / diag_phi
+            circi = pd.DataFrame(circi_np, columns=df.columns)
 
             df_sistema["score"] = 0
 
-            # Monta um dataframe de forma decrescente das varaiveis conforme seu score
+            # Monta um dataframe de forma decrescente das variáveis conforme seu score
             df_rci = pd.DataFrame({"score": rci, "variavel": df.columns})
             df_rci = df_rci.sort_values(by="score", ascending=False)
 
-            for _, row in df_rci.iterrows():
-                tag = row["variavel"]
-                val = row["score"]
-                idx = df_sistema[df_sistema["VARIAVEL"] == tag].index
-
-                df_sistema.loc[idx, "score"] = val
+            # Otimização: Mapeamento de scores direto no df_sistema ao invés de usar iterrows e loc
+            score_dict = dict(zip(df_rci["variavel"], df_rci["score"]))
+            df_sistema["score"] = df_sistema["VARIAVEL"].map(score_dict).fillna(0)
 
             df_score_dec = df_sistema.sort_values(by="score", ascending=False)
-
 
             # Recria a phi tirando um a um as varaiveis que mais influenciam até o phi ficar abaixo do limiar
             val_contr = []
@@ -300,96 +266,76 @@ class FuturaiML:
 
                 val_contr.append(i)
 
-                eps = np.eye(linhas_colunas[1])
-                eps = eps[:, val_contr]
-                eps = pd.DataFrame(eps)
+                eps = np.eye(M)[:, val_contr]
+                phi_eps = eps.T @ phi_np @ eps
+                inv_phi_eps = np.linalg.inv(phi_eps)
 
-                # Definindo Trci - diagonal matrix which the elements are one for the faulty variables
-                k = [0] * linhas_colunas[1]
-                for x in val_contr:
-                    k[x] = 1
-                trci = np.diag(k)
+                # Definindo Trci - matriz diagonal com elementos um para as variáveis defeituosas
+                I_trci = np.eye(M)
+                for x_idx in val_contr:
+                    I_trci[x_idx, x_idx] = 0
 
-                # equação 13 - reconstrução das variáveis em falta
-                termo_1 = -np.linalg.inv(eps.T.dot(phi).dot(eps))
-                termo_2 = eps.T
-                termo_3 = phi
-                termo_4 = pd.DataFrame(np.eye(linhas_colunas[1]) - trci)
-                termo_5 = df.T
+                # Reconstrução das variáveis em falta
+                phi_sub = phi_np[val_contr, :]
+                phi_sub_clean = phi_sub @ I_trci
+                
+                n_fast_np = - inv_phi_eps @ phi_sub_clean @ df_np.T
+                n_fast_np = n_fast_np.T
 
-                n_fast = termo_1.dot(termo_2).dot(termo_3).dot(termo_4).dot(termo_5)
-                n_fast = n_fast.T
+                # Otimização: Cálculo vetorizado de phiast para todas as linhas (substitui loop de N iterações)
+                df_clean = df_np @ I_trci
+                part1 = np.sum((df_clean @ phi_np) * df_clean, axis=1)
+                part2 = np.sum((n_fast_np @ phi_eps) * n_fast_np, axis=1)
+                phiast = part1 - part2
 
-                phiast = []
-                for x in list(range(linhas_colunas[0])):
-
-                    termo_1 = df.iloc[x, :].values
-                    termo_2 = np.eye(linhas_colunas[1]) - trci
-                    termo_3 = phi
-                    termo_4 = termo_2
-                    termo_5 = df.iloc[x, :].T.values
-                    termo_6 = n_fast[x, :]
-                    termo_7 = eps.T.dot(phi).dot(eps)
-                    termo_8 = termo_6.T
-
-                    phiast.append(
-                        float(
-                            (
-                                termo_1.dot(termo_2)
-                                .dot(termo_3)
-                                .dot(termo_4)
-                                .dot(termo_5)
-                            )
-                            - (termo_6.dot(termo_7).dot(termo_8))
-                        )
-                    )
-                if max(phiast) < self.phi_lim and qtd_aux >= 3:
+                if np.max(phiast) < self.phi_lim and qtd_aux >= 3:
                     break
 
                 # Quantidade de varaiveis que mais influenciaram
                 qtd_aux = qtd_aux + 1
 
-
             # Separa as varaiveis que mais influenciam das restantes
-            df_score_prin = df_score_dec.iloc[0:qtd_aux]
-
+            df_score_prin = df_score_dec.iloc[0:qtd_aux].copy()
             df_score_prin.reset_index(inplace=True, drop=True)
 
             ##### Gera dataframe com a projeção das variáveis PRINCIPAIS #####
-            df_projection_prin_vars = pd.DataFrame(n_fast)
+            df_projection_prin_vars = pd.DataFrame(n_fast_np)
             df_projection_prin_vars.columns = list(df_score_prin["VARIAVEL"])
-            df_projection_prin_vars = (df_projection_prin_vars*self.std) + self.media
+            df_projection_prin_vars = (df_projection_prin_vars * self.std) + self.media
             df_projection_prin_vars = df_projection_prin_vars[list(df_score_prin["VARIAVEL"])]
+            
             # Resample Dataframe
             if eixo_x_proj is not None:
                 df_projection_prin_vars['timestamp'] = list(eixo_x_proj)
                 df_projection_prin_vars = df_projection_prin_vars.set_index('timestamp')
                 df_projection_prin_vars = df_projection_prin_vars.resample('1T').asfreq()
                 df_projection_prin_vars.reset_index(inplace=True)
-                df_projection_prin_vars.drop('timestamp', inplace=True, axis=1)
+                if 'timestamp' in df_projection_prin_vars.columns:
+                    df_projection_prin_vars.drop('timestamp', inplace=True, axis=1)
 
             ##### Gera dataframe com a projeção de todas as VARIAVEIS #####
-            df_projection_full = pd.DataFrame(n_fast_list)
-            df_projection_full = (df_projection_full*self.std) + self.media
+            df_projection_full = n_fast_list.copy()
+            df_projection_full = (df_projection_full * self.std) + self.media
             # Resample Dataframe
             if eixo_x_proj is not None:
                 df_projection_full['timestamp'] = list(eixo_x_proj)
                 df_projection_full = df_projection_full.set_index('timestamp')
                 df_projection_full = df_projection_full.resample('1T').asfreq()
                 df_projection_full.reset_index(inplace=True)
-                df_projection_full.drop('timestamp', inplace=True, axis=1)
+                if 'timestamp' in df_projection_full.columns:
+                    df_projection_full.drop('timestamp', inplace=True, axis=1)
 
-            df_score_res = df_score_dec.iloc[qtd_aux:]
+            df_score_res = df_score_dec.iloc[qtd_aux:].copy()
 
             ######## Geração do grafico hierarquico conforme local ########
-            soma = df_score_prin["score"].sum()
+            soma_prin = df_score_prin["score"].sum()
             df_score_prin["%"] = df_score_prin.score.apply(
-                lambda x: round((x / soma * 100), 5)
+                lambda x: round((x / soma_prin * 100), 5) if soma_prin > 0 else 0
             )
 
-            soma = df_score_dec["score"].sum()
+            soma_dec = df_score_dec["score"].sum()
             df_score_dec["%"] = df_score_dec.score.apply(
-                lambda x: round((x / soma * 100), 5)
+                lambda x: round((x / soma_dec * 100), 5) if soma_dec > 0 else 0
             )
 
             # Geração do grafico de contribuição - As variaiveis que menos influenciaram são zeradas para não poluir o grafico
@@ -402,15 +348,15 @@ class FuturaiML:
                 pd.Series(list(eixo_x)).rename("timestamp"), how="right"
             )
 
-            df_contribuicao = df_contribuicao.to_json(orient="columns")
-            df_score_prin = df_score_prin.to_json(orient="columns")
-            df_score_dec = df_score_dec.to_json(orient="columns")
+            df_contribuicao_json = df_contribuicao.to_json(orient="columns")
+            df_score_prin_json = df_score_prin.to_json(orient="columns")
+            df_score_dec_json = df_score_dec.to_json(orient="columns")
 
             return (
-                json.loads(df_score_prin),
-                json.loads(df_contribuicao),
-                json.loads(df_score_dec),
-                df_projection_full
+                json.loads(df_score_prin_json),
+                json.loads(df_contribuicao_json),
+                json.loads(df_score_dec_json),
+                df_projection_prin_vars
             )
 
         except ValueError as err:
