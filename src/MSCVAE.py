@@ -18,8 +18,18 @@ class AttributeMatrixGenerator:
     Transforms raw multivariate time-series into spatial-temporal correlation matrices
     and target values for the Hybrid MSCVAE model.
     """
-    def __init__(self, window_size=10, step=10):
-        self.w = window_size # Time steps captured in a single matrix (temporal context)
+    def __init__(self, window_sizes=(10, 30, 60), step=10):
+        # Multi-scale temporal windows. Each scale s produces an N x N attribute matrix
+        # M_t^(s) = X_{t-s:t} X_{t-s:t}^T / s, stacked along the channel dimension so the CNN
+        # sees short- and long-range correlation structure simultaneously. This realizes the
+        # "Multi-Scale" of MSCVAE/MSCRED instead of a single fixed window. Scales are
+        # de-duplicated and sorted ascending.
+        if isinstance(window_sizes, int):
+            window_sizes = [window_sizes]
+        self.window_sizes = sorted({int(w) for w in window_sizes})
+        # Effective window used for time-alignment / minimum history: the LARGEST scale,
+        # since a sample only exists once every scale has a full window of history behind it.
+        self.w = max(self.window_sizes)
         self.step = step     # Sliding window stride (step=w means no overlap)
         self.mean = None
         self.std = None
@@ -56,31 +66,39 @@ class AttributeMatrixGenerator:
         target_values = []
 
         if len(values) < self.w:
-            # Return empty tuple if df is too small (i.e. smaller than window_size)
+            # Return empty tuple if df is too small (i.e. smaller than the largest window)
             return torch.empty(0), torch.empty(0)
 
-        # Sliding window extraction
+        values_t = torch.tensor(values, dtype=torch.float32)
+
+        # Sliding window extraction. The window END is driven by the LARGEST scale so every
+        # scale has full history; smaller scales simply read their own (shorter) tail.
         for t in range(self.w, len(values), self.step):
-            x_segment = values[t-self.w : t] # Shape: (window_size, n_features)
+            scale_mats = []
+            for w_s in self.window_sizes:
+                x_segment = values_t[t - w_s:t]                  # (w_s, n_features)
 
-            # Matrix (Eq. 1 from paper) - Spatial-temporal inner product
-            # Captures correlations between all pairs of sensors within the window
-            # Kernel Trick can be applied here but the model already has a non-linear decoder and the anomaly detection get less sensitive.
-            x_t = torch.tensor(x_segment, dtype=torch.float32).T # Shape: (n_features, window_size)
-            m_t = torch.matmul(x_t, x_t.T) / self.w              # Shape: (n_features, n_features)
-            matrices.append(m_t)
+                # Matrix (Eq. 1 from paper) - Spatial-temporal inner product at scale w_s.
+                # Captures correlations between all pairs of sensors within the window.
+                # Kernel Trick can be applied here but the model already has a non-linear
+                # decoder and the anomaly detection gets less sensitive.
+                x_t = x_segment.T                                # (n_features, w_s)
+                m_t = torch.matmul(x_t, x_t.T) / w_s             # (n_features, n_features)
+                scale_mats.append(m_t)
 
-            # Extracts the exact raw values of the last timestamp in the window.
+            # Stack scales on the channel dimension -> (n_scales, n_features, n_features)
+            matrices.append(torch.stack(scale_mats, dim=0))
+
+            # Exact raw values of the last timestamp in the window (shared across scales).
             # Used as the ground truth for the Hybrid MLP val_decoder.
-            last_val = torch.tensor(x_segment[-1], dtype=torch.float32)
-            target_values.append(last_val)
+            target_values.append(values_t[t - 1])
 
         if not matrices:
             return torch.empty(0), torch.empty(0)
 
         # Tuple: (Tensor of Matrices, Tensor of Values)
-        # unsqueeze(1) adds a 'Channel' dimension (B, 1, N, N) required by PyTorch Conv2d layers.
-        return torch.stack(matrices).unsqueeze(1), torch.stack(target_values)
+        # The channel dimension (B, n_scales, N, N) carries the scales for Conv2d layers.
+        return torch.stack(matrices), torch.stack(target_values)
 
 
 class SequenceMatrixDataset(Dataset):
@@ -130,12 +148,32 @@ class SpatialTemporalTransformer(nn.Module):
     def forward(self, sequence_tensor):
         B, T, C, H, W = sequence_tensor.size()
         x = sequence_tensor.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
+        # Inject temporal order: self-attention is permutation-invariant, so without a
+        # positional signal this module collapses into an order-agnostic pooling over the
+        # window sequence. A sinusoidal encoding restores temporal ordering, letting the
+        # transformer actually model the evolution/inertia of the system state.
+        x = x + self._temporal_positional_encoding(T, C, x.device, x.dtype).unsqueeze(0)
         attn_out, _ = self.attn(x, x, x)
         x = self.norm1(x + attn_out)
         ffn_out = self.ffn(x)
         x = self.norm2(x + ffn_out)
         out = x.reshape(B, H, W, T, C).permute(0, 3, 4, 1, 2)
         return out[:, -1, :, :, :]
+
+    @staticmethod
+    def _temporal_positional_encoding(T, C, device, dtype):
+        """
+        Deterministic sinusoidal positional encoding of shape (T, C) over the time axis.
+        Parameter-free (no learned weights, so it adds no reproducibility risk) and works
+        for any sequence length T, including the degenerate T=1 case.
+        """
+        pos = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)      # (T, 1)
+        idx = torch.arange(0, C, 2, device=device, dtype=dtype)             # (C/2,)
+        div = torch.exp(-math.log(10000.0) * idx / C)
+        pe = torch.zeros(T, C, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe
 
 
 class MSCVAE_Hybrid(nn.Module):
@@ -151,25 +189,28 @@ class MSCVAE_Hybrid(nn.Module):
        - Route 2 (CNN): Reconstructs correlation matrices (sensitive to relationship breaks).
 
     Input contract:
-       forward(x) expects x of shape (B, T, 1, N, N) -- a batch of temporal sequences.
-       A 4D tensor (B, 1, N, N) is accepted as a degenerate sequence of length 1.
+       forward(x) expects x of shape (B, T, n_scales, N, N) -- a batch of temporal sequences,
+       where the channel dimension carries the multi-scale attribute matrices.
+       A 4D tensor (B, n_scales, N, N) is accepted as a degenerate sequence of length 1.
        The matrix that is reconstructed / scored is always the LAST timestep (x[:, -1]).
     """
-    def __init__(self, n_features):
+    def __init__(self, n_features, n_scales=1):
         super(MSCVAE_Hybrid, self).__init__()
         self.n_features = n_features
+        # Number of multi-scale attribute matrices stacked as input/output channels.
+        self.n_scales = n_scales
         # Latent dimension scaled by the square root of features to prevent over-compression
         latent_dim = round(math.sqrt(n_features))
 
-        # Encoder: Extracts hierarchical spatial features from the correlation matrix
-        self.enc1 = nn.Conv2d(1, 16, 3, 2, 1)
+        # Encoder: Extracts hierarchical spatial features from the (multi-scale) matrices
+        self.enc1 = nn.Conv2d(n_scales, 16, 3, 2, 1)
         self.enc2 = nn.Conv2d(16, 32, 3, 2, 1)
         self.enc3 = nn.Conv2d(32, 64, 3, 2, 1)
 
         # Dummy pass: Automatically calculates the flattened dimension size after convolutions.
         # This makes the architecture dynamic and adaptable to any number of sensors (n_features).
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, n_features, n_features)
+            dummy = torch.zeros(1, n_scales, n_features, n_features)
             out = self.enc3(self.enc2(self.enc1(dummy)))
             self.flatten_dim = out.view(1, -1).size(1)
             self.spatial_shape = out.shape[1:]
@@ -199,10 +240,11 @@ class MSCVAE_Hybrid(nn.Module):
         # Temporal Modeling
         self.transformer = SpatialTemporalTransformer(channels=64)
 
-        # Convolutional Decoder: Upsamples the combined (Z + Temporal) features back to the original N x N matrix size
+        # Convolutional Decoder: Upsamples the combined (Z + Temporal) features back to the
+        # original N x N matrices, one output channel per scale.
         self.dec3 = nn.ConvTranspose2d(64, 32, 3, 2, 1, output_padding=1)
         self.dec2 = nn.ConvTranspose2d(32, 16, 3, 2, 1, output_padding=1)
-        self.dec1 = nn.ConvTranspose2d(16, 1, 3, 2, 1, output_padding=1)
+        self.dec1 = nn.ConvTranspose2d(16, n_scales, 3, 2, 1, output_padding=1)
 
         # Homoscedastic uncertainty parameters (learned task balancing, Kendall et al.)
         self.log_var_mat = nn.Parameter(torch.zeros(1))
@@ -226,10 +268,11 @@ class MSCVAE_Hybrid(nn.Module):
             x = x.unsqueeze(1)
 
         B, T = x.size(0), x.size(1)
+        C_in = x.size(2)  # number of scale channels
         N = x.size(-1)
 
         # Encode every timestep in the sequence in a single batched pass.
-        x_flat = x.reshape(B * T, 1, N, N)
+        x_flat = x.reshape(B * T, C_in, N, N)
         e3 = F.relu(self.enc3(F.relu(self.enc2(F.relu(self.enc1(x_flat))))))
         C, h, w = e3.size(1), e3.size(2), e3.size(3)
         e3_seq = e3.view(B, T, C, h, w)
@@ -265,7 +308,8 @@ class MSCVAE_Hybrid(nn.Module):
 
     def loss_function(self, recon_matrix, x_matrix, recon_values, x_values, mu, logvar, beta=0.6):
         n_features = x_matrix.shape[2]
-        n_elements_matrix = x_matrix.shape[2] * x_matrix.shape[3]
+        # Per-sample element count of the matrix target now spans all scale channels.
+        n_elements_matrix = x_matrix.shape[1] * x_matrix.shape[2] * x_matrix.shape[3]
 
         mse_mat_mean = F.mse_loss(recon_matrix, x_matrix, reduction='mean')
         mse_val_mean = F.mse_loss(recon_values, x_values, reduction='mean')
@@ -523,16 +567,33 @@ class MSCVAE:
     data preprocessing (matrix generation), model training, dynamic threshold
     calculation (SPOT), and root cause analysis (contribution).
     """
-    def __init__(self, n_features=None, window_size=10, stride=1, seq_len=5, device=None, seed=42):
+    def __init__(self, n_features=None, window_sizes=None, window_size=None, stride=1,
+                 seq_len=5, device=None, seed=42):
         self.seed = seed
         # Enforce reproducibility right at initialization
         self.set_deterministic(self.seed)
 
         self.n_features = n_features
-        self.window_size = window_size
+        # Multi-scale windows. Default is the paper-inspired {10, 30, 60}. Back-compat: a
+        # single `window_size` (int) still produces a single-scale model; `window_sizes`
+        # (list/tuple) takes precedence when provided.
+        if window_sizes is None:
+            window_sizes = (10, 30, 60) if window_size is None else window_size
+        if isinstance(window_sizes, int):
+            window_sizes = [window_sizes]
+        self.window_sizes = sorted({int(w) for w in window_sizes})
+        # Largest scale doubles as the reference window for time-alignment.
+        self.window_size = max(self.window_sizes)
         self.stride = stride
         # Number of consecutive windows fed to the temporal transformer per sample.
         self.seq_len = max(1, int(seq_len))
+
+        # Root-cause attribution weights. The matrix DIAGONAL (a variable's own variance
+        # reconstruction error) is a clean self-signal; the OFF-DIAGONAL residual is shared
+        # between correlated pairs, so a single anomalous variable smears error onto its
+        # partners. We down-weight the relational channel to avoid blaming innocents.
+        self.rca_self_weight = 1.0
+        self.rca_rel_weight = 0.5
 
         # Hardware selection: automatically defaults to GPU if available for faster tensor operations
         if device is None:
@@ -547,7 +608,7 @@ class MSCVAE:
 
         self.model = None
         # Instantiates the generator that will transform flat series into spatial-temporal inputs
-        self.generator = AttributeMatrixGenerator(window_size=self.window_size, step=self.stride)
+        self.generator = AttributeMatrixGenerator(window_sizes=self.window_sizes, step=self.stride)
 
         self.threshold = None
         # Gain acts as a manual sensitivity tuner applied on top of the SPOT statistical threshold
@@ -556,8 +617,12 @@ class MSCVAE:
         # Per-variable baseline reconstruction-error statistics (median + MAD), calibrated
         # on the NORMAL training data. These turn raw errors into deviations from each
         # variable's own normal behavior, which is the basis for honest root-cause analysis.
-        self.mat_err_med_ = None
-        self.mat_err_mad_ = None
+        # The matrix error is split into the DIAGONAL (self/variance) and OFF-DIAGONAL
+        # (relational) channels so attribution can lean on the clean self-signal.
+        self.mat_diag_med_ = None
+        self.mat_diag_mad_ = None
+        self.mat_off_med_ = None
+        self.mat_off_mad_ = None
         self.val_err_med_ = None
         self.val_err_mad_ = None
 
@@ -644,7 +709,9 @@ class MSCVAE:
         )
 
         # Initialize Model
-        self.model = MSCVAE_Hybrid(n_features=self.n_features).to(self.device)
+        self.model = MSCVAE_Hybrid(
+            n_features=self.n_features, n_scales=len(self.generator.window_sizes)
+        ).to(self.device)
         # Adam optimizer is used due to its adaptive learning rate, which is highly
         # effective for training the distinct components of a Hybrid VAE simultaneously.
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -685,8 +752,10 @@ class MSCVAE:
 
         # Post-Training: Threshold Calibration (POT)
         if verbose: print("Calculating threshold...")
-        # Evaluates the model on the normal training data to establish the baseline error distribution
-        train_scores = self._get_anomaly_scores(final_train_matrix)
+        # Evaluates the model on the normal training data to establish the baseline error
+        # distribution. Uses the COMBINED (matrix + value) score, so SPOT calibrates the
+        # threshold on exactly the quantity predict() will compare against.
+        train_scores = self._get_anomaly_scores(final_train_matrix, final_train_values)
 
         # Applies Extreme Value Theory (SPOT algorithm) to find the mathematical upper limit
         # of normal reconstruction errors, providing a strict, unsupervised alarm threshold.
@@ -704,87 +773,134 @@ class MSCVAE:
         if verbose: print("Calibrating per-variable error baseline...")
         self._calibrate_variable_baseline(final_train_matrix, final_train_values)
 
-    def _get_anomaly_scores(self, data_tensor, batch_size=128):
+    def _task_precisions(self):
         """
-        Calculates the raw anomaly score (phi) for each timestamp based purely on
-        the spatial-temporal matrix reconstruction error.
-        The matrix represents the core physical relationships between sensors.
-        If the correlation breaks, the system is fundamentally anomalous.
+        Reads the model's learned homoscedastic precisions (exp(-log_var)) for the matrix
+        and value reconstruction tasks. These are the model's OWN learned relative weights,
+        so reusing them to combine the two error channels keeps the anomaly score on the
+        same geometry as the training objective. Returns plain floats (deterministic).
+        """
+        with torch.no_grad():
+            p_mat = float(torch.exp(-self.model.log_var_mat).item())
+            p_val = float(torch.exp(-self.model.log_var_val).item())
+        return p_mat, p_val
 
-        Reproducible by construction: temporal context lives inside each sequence
-        item, so the score no longer depends on batch_size.
+    def _get_anomaly_scores(self, data_tensor, values=None, batch_size=128):
+        """
+        Calculates the anomaly score (phi) for each window by COMBINING both reconstruction
+        routes:
+          - the spatial-temporal correlation matrix (sensitive to relationship breaks);
+          - the raw-value reconstruction (sensitive to point/contextual peaks that barely
+            move the correlation matrix after z-scoring and the 1/w averaging).
+        The two channels are weighted by the model's learned homoscedastic precisions, so the
+        value route -- trained but historically unused at scoring time -- now contributes to
+        detection. When `values` is None the score degrades gracefully to matrix-only.
+
+        Reproducible by construction: temporal context lives inside each sequence item, so
+        the score does not depend on batch_size.
         """
         self.model.eval()
-        mse_loss = nn.MSELoss(reduction='none')
+        p_mat, p_val = self._task_precisions()
+        use_val = values is not None
         scores = []
 
-        loader = self._seq_loader(data_tensor, None, batch_size=batch_size, shuffle=False)
+        loader = self._seq_loader(data_tensor, values, batch_size=batch_size, shuffle=False)
 
         with torch.no_grad():
-            for batch_seq, _ in loader:
-                x = batch_seq.to(self.device).float()      # (B, T, 1, N, N)
-                recon_mat, _, _, _ = self.model(x)
-                target = x[:, -1]                          # (B, 1, N, N)
+            for batch_seq, batch_val in loader:
+                x = batch_seq.to(self.device).float()      # (B, T, n_scales, N, N)
+                recon_mat, recon_val, _, _ = self.model(x)
+                target = x[:, -1]                          # (B, n_scales, N, N)
 
-                # Total squared error of the current window (channels, height, width).
-                loss = mse_loss(recon_mat, target).sum(dim=(1, 2, 3)).cpu().numpy()
-                scores.extend(loss)
+                # Per-window sum of squared error for each route.
+                mat_sumsq = (recon_mat - target).pow(2).sum(dim=(1, 2, 3))
+                if use_val:
+                    v = batch_val.to(self.device).float()
+                    val_sumsq = (recon_val - v).pow(2).sum(dim=1)
+                    phi = p_mat * mat_sumsq + p_val * val_sumsq
+                else:
+                    phi = p_mat * mat_sumsq
+
+                scores.extend(phi.cpu().numpy())
 
         return np.array(scores)
 
     def _get_variable_errors(self, matrices, values, batch_size=128, return_recon=False):
         """
-        Per-WINDOW, per-VARIABLE reconstruction error.
+        Per-WINDOW, per-VARIABLE reconstruction error, decomposed into three channels.
+
+        The N x N matrix residual is summed over the scale channels, then split into a self
+        and a relational part instead of being collapsed into a single number. This is what
+        lets root-cause analysis avoid spreading blame: when variable i is anomalous, EVERY
+        pair (i, j) breaks, so a naive row+col sum implicates every correlated partner j.
+        The diagonal does not have this problem.
 
         Returns
         -------
-        mat_err : ndarray (T, N)
-            Matrix reconstruction error attributed to each variable. The N x N residual
-            is symmetrized (row + column) before aggregating, so attribution does not
-            depend on the (asymmetric) decoder orientation. Note Sum_i mat_err[t, i]
-            equals 2 * phi[t] (each off-diagonal residual is counted from both endpoints).
+        mat_diag : ndarray (T, N)
+            Matrix DIAGONAL error err[i, i] (summed over scales) -- variable i's own
+            variance/energy reconstruction error. The CLEAN self-signal.
+        mat_off : ndarray (T, N)
+            Matrix OFF-DIAGONAL error (row + column, diagonal removed; summed over scales)
+            -- the relational error shared between i and its partners; weaker, contextual
+            evidence. Note Sum_i mat_off[t, i] = 2 * (off-diagonal total).
         val_err : ndarray (T, N)
             Squared error of the raw-value reconstruction per variable.
         recon_vals : ndarray (T, N), optional
             The (still z-scored) reconstructed values, returned when return_recon=True.
+
+        The full per-window matrix error used by the detector equals
+        mat_diag.sum(1) + mat_off.sum(1) / 2.
         """
         self.model.eval()
         loader = self._seq_loader(matrices, values, batch_size=batch_size, shuffle=False)
 
-        mat_list, val_list, recon_list = [], [], []
+        diag_list, off_list, val_list, recon_list = [], [], [], []
         with torch.no_grad():
             for batch_seq, batch_val in loader:
-                x = batch_seq.to(self.device).float()          # (B, T, 1, N, N)
+                x = batch_seq.to(self.device).float()          # (B, T, n_scales, N, N)
                 recon_mat, recon_val, _, _ = self.model(x)
-                target = x[:, -1]                              # (B, 1, N, N)
+                target = x[:, -1]                              # (B, n_scales, N, N)
 
-                err = (target - recon_mat).pow(2).squeeze(1)   # (B, N, N)
-                per_var_mat = err.sum(dim=2) + err.sum(dim=1)  # row + col -> (B, N)
-                mat_list.append(per_var_mat.cpu().numpy())
+                err = (target - recon_mat).pow(2).sum(dim=1)   # sum scales -> (B, N, N)
+                diag = torch.diagonal(err, dim1=1, dim2=2)     # (B, N) self error
+                row = err.sum(dim=2)                           # (B, N) includes diagonal
+                col = err.sum(dim=1)                           # (B, N) includes diagonal
+                off = (row - diag) + (col - diag)              # (B, N) off-diagonal only
+                diag_list.append(diag.cpu().numpy())
+                off_list.append(off.cpu().numpy())
 
                 v = batch_val.to(self.device).float()
                 val_list.append((v - recon_val).pow(2).cpu().numpy())
                 if return_recon:
                     recon_list.append(recon_val.cpu().numpy())
 
-        mat_err = np.concatenate(mat_list, axis=0)
+        mat_diag = np.concatenate(diag_list, axis=0)
+        mat_off = np.concatenate(off_list, axis=0)
         val_err = np.concatenate(val_list, axis=0)
         if return_recon:
-            return mat_err, val_err, np.concatenate(recon_list, axis=0)
-        return mat_err, val_err
+            return mat_diag, mat_off, val_err, np.concatenate(recon_list, axis=0)
+        return mat_diag, mat_off, val_err
 
     def _calibrate_variable_baseline(self, matrices, values, batch_size=128):
         """
-        Stores the median and (scaled) MAD of each variable's reconstruction error over
-        the NORMAL training data. Robust statistics are used so a few extreme windows do
-        not inflate the baseline. These define what 'normal error' looks like per variable.
+        Stores the median and (scaled) MAD of each variable's reconstruction error over the
+        NORMAL training data, separately for the matrix diagonal (self), matrix off-diagonal
+        (relational) and raw-value channels. Robust statistics are used so a few extreme
+        windows do not inflate the baseline. These define what 'normal error' looks like per
+        variable and per channel.
         """
-        mat_err, val_err = self._get_variable_errors(matrices, values, batch_size=batch_size)
+        mat_diag, mat_off, val_err = self._get_variable_errors(matrices, values, batch_size=batch_size)
         k = 1.4826  # makes MAD comparable to a Gaussian standard deviation
-        self.mat_err_med_ = np.median(mat_err, axis=0)
-        self.mat_err_mad_ = np.median(np.abs(mat_err - self.mat_err_med_), axis=0) * k + 1e-9
-        self.val_err_med_ = np.median(val_err, axis=0)
-        self.val_err_mad_ = np.median(np.abs(val_err - self.val_err_med_), axis=0) * k + 1e-9
+
+        def _med_mad(a):
+            med = np.median(a, axis=0)
+            mad = np.median(np.abs(a - med), axis=0) * k + 1e-9
+            return med, mad
+
+        self.mat_diag_med_, self.mat_diag_mad_ = _med_mad(mat_diag)
+        self.mat_off_med_, self.mat_off_mad_ = _med_mad(mat_off)
+        self.val_err_med_, self.val_err_mad_ = _med_mad(val_err)
 
     def _pot_eval(self, init_score, q=1e-4, level=0.02):
         """
@@ -818,9 +934,9 @@ class MSCVAE:
 
         self.model.eval()
 
-        # Transform raw test data into correlation matrices
+        # Transform raw test data into correlation matrices (and the matching raw values).
         try:
-            tensor_matrices, _ = self.generator.generate(df_test)
+            tensor_matrices, tensor_values = self.generator.generate(df_test)
         except ValueError as e:
             print(f"Generation error: {e}")
             return {}
@@ -829,8 +945,8 @@ class MSCVAE:
             print(f"Test dataframe too small for window {self.generator.w}.")
             return {}
 
-        # Get the raw anomaly score (reconstruction error) for each matrix
-        all_scores = self._get_anomaly_scores(tensor_matrices, batch_size=batch_size)
+        # Combined anomaly score (matrix + value routes) for each window.
+        all_scores = self._get_anomaly_scores(tensor_matrices, tensor_values, batch_size=batch_size)
 
         # Time Alignment
         # The generator uses a sliding window (w) and a step size (s).
@@ -942,21 +1058,24 @@ class MSCVAE:
         """
         Core of the Root Cause Analysis.
 
-        For every generated window it computes each variable's reconstruction error,
-        STANDARDIZES it against that variable's own normal baseline (median + MAD from
-        training), keeps only the positive excess, then aggregates ONLY over the windows
-        that belong to the detected anomaly.
+        For every generated window it computes each variable's reconstruction error in three
+        channels (matrix diagonal / matrix off-diagonal / raw value), STANDARDIZES each
+        against that variable's own normal baseline (median + MAD from training), keeps only
+        the positive excess, then aggregates ONLY over the windows that belong to the
+        detected anomaly.
 
         This answers the real question -- "which variables deviated from their own normal
         behavior during the anomaly" -- instead of "which variables have large absolute
         error over the whole period" (which just re-discovers chronically noisy sensors).
+        The diagonal (self) channel is weighted above the off-diagonal (relational) one so a
+        single anomalous variable does not smear blame onto its correlated partners.
 
         Returns a dict with: variable_names, contrib (Σ excess over anomalous windows),
         peak_z (max standardized excess over those windows), phi, anom_mask, recon_vals.
         """
         if self.model is None:
             raise ValueError("Model not trained. Call .fit() first!")
-        if self.mat_err_med_ is None:
+        if self.mat_diag_med_ is None:
             raise ValueError("Per-variable baseline not calibrated. Re-run .fit().")
 
         self.model.eval()
@@ -971,16 +1090,24 @@ class MSCVAE:
         if tensor_matrices.nelement() == 0:
             raise ValueError("No matrices generated from input dataframe!")
 
-        mat_err, val_err, recon_vals = self._get_variable_errors(
+        mat_diag, mat_off, val_err, recon_vals = self._get_variable_errors(
             tensor_matrices, tensor_values, batch_size=batch_size, return_recon=True
         )
 
-        # phi per window, consistent with the detector (matrix error). mat_err is row+col,
-        # i.e. twice the total matrix error, hence the /2.
-        phi = mat_err.sum(axis=1) / 2.0
+        # Per-window phi, IDENTICAL to the detector's COMBINED score (matrix + value, weighted
+        # by the learned precisions), so the windows selected here match those that tripped
+        # the threshold. Full matrix error = diag.sum + off.sum/2 (off counted from both ends).
+        p_mat, p_val = self._task_precisions()
+        mat_sumsq = mat_diag.sum(axis=1) + mat_off.sum(axis=1) / 2.0
+        val_sumsq = val_err.sum(axis=1)
+        phi = p_mat * mat_sumsq + p_val * val_sumsq
 
-        # Standardized positive excess over each variable's own normal baseline.
-        s_mat = np.clip((mat_err - self.mat_err_med_) / self.mat_err_mad_, 0, None)
+        # Standardized positive excess over each variable's own normal baseline, per channel.
+        s_diag = np.clip((mat_diag - self.mat_diag_med_) / self.mat_diag_mad_, 0, None)
+        s_off = np.clip((mat_off - self.mat_off_med_) / self.mat_off_mad_, 0, None)
+        # Lean on the clean self-signal (diagonal); treat the smeared relational error as
+        # weaker corroborating evidence so correlated-but-innocent variables are not blamed.
+        s_mat = self.rca_self_weight * s_diag + self.rca_rel_weight * s_off
         if combine_value:
             s_val = np.clip((val_err - self.val_err_med_) / self.val_err_mad_, 0, None)
             s = s_mat + s_val
@@ -992,7 +1119,7 @@ class MSCVAE:
         contrib = s[anom_mask].sum(axis=0)     # total standardized excess during the anomaly
         peak_z = s[anom_mask].max(axis=0)      # strongest single-window deviation
 
-        del tensor_matrices, tensor_values, mat_err, val_err
+        del tensor_matrices, tensor_values, mat_diag, mat_off, val_err
         gc.collect()
 
         return {
